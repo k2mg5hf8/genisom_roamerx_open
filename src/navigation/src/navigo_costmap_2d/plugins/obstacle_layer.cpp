@@ -42,6 +42,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cmath>
 
 #include "pluginlib/class_list_macros.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
@@ -483,12 +484,32 @@ ObstacleLayer::updateBounds(
         RCLCPP_DEBUG(logger_, "The point is too far away");
         continue;
       }
+      
 
-      // if the point is too close, do not conisder it
+
+      // if the point is too close, do not consider it -- unless it's a "truncated sphere"
+      // exemption: still inside the min-range dead zone, but far enough forward (along the
+      // robot heading) to be a real obstacle rather than the side-mounted lidar guard rods
       if (sq_dist < sq_obstacle_min_range) {
-        RCLCPP_DEBUG(logger_, "The point is too close");
-        continue;
+        bool keep_as_forward_exemption = false;
+        // if (obs.obstacle_min_range_front_ > 0.0) {
+        double dx = px - obs.origin_.x;
+        double dy = py - obs.origin_.y;
+        double fwd = dx * std::cos(robot_yaw) + dy * std::sin(robot_yaw);
+        keep_as_forward_exemption = fwd > 0.1; ////hardcode 
+        // }
+        if (!keep_as_forward_exemption) {
+          RCLCPP_DEBUG(logger_, "The point is too close");
+          continue;
+        }
       }
+
+
+      // // if the point is too close, do not conisder it
+      // if (sq_dist < sq_obstacle_min_range) {
+      //   RCLCPP_DEBUG(logger_, "The point is too close");
+      //   continue;
+      // }
 
       // now we need to compute the map coordinates for the observation
       unsigned int mx, my;

@@ -16,10 +16,6 @@ find_package(rosidl_default_generators REQUIRED)
 
 
 set(msg_files
-	"msg/ArcState.msg"
-  	"msg/DockState.msg"
-  	"msg/McModeCmd.msg"
-  	"msg/McState.msg"
         "msg/BmsCmd.msg"
         "msg/BmsState.msg"
         "msg/Cartesian.msg"

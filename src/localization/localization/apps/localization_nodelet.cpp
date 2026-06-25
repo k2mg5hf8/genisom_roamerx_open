@@ -256,9 +256,13 @@ private:
   float imu_init_max_acce_var_ = 0.2f;
   // Initial pose initialization parameters
   int init_match_count_threshold_ = 5;
+  int bad__match_count_threshold_ = init_match_count_threshold_ * 2;
   float init_match_score_threshold_ = 0.2f;
+  float reliable_threshold_ = 0.1f;
   // Initial pose initialization state variables
   int init_match_count_ = 0;
+  int bad_match_count_ = 0;
+  int recovery_count_multiplier_ = 1;
   pcl::Registration<PointT, PointT>::Ptr create_registration() {
     if (reg_method == "NDT_OMP") {
       RCLCPP_INFO(get_logger(), "NDT_OMP is selected");
@@ -356,6 +360,33 @@ private:
     }
   }
 
+  void make_recovery(){
+
+    RCLCPP_WARN(get_logger(), "Recovery: return to the last reliable pose");
+    if (!has_reliable_pose_) {
+        RCLCPP_WARN(get_logger(), "Recovery: no reliable pose saved yet, cannot recover");
+        return;
+    }
+    Eigen::Vector3f    new_pos  = last_reliable_pose_.block<3, 1>(0, 3);
+    Eigen::Quaternionf new_quat(last_reliable_pose_.block<3, 3>(0, 0));
+
+    last_init_pos_ = new_pos;
+    last_init_quat_ = new_quat;
+    has_set_init_pose_ = true;
+    last_pose_source_ = "Recovery";   
+    pose_estimator.reset(new localization::PoseEstimator(
+      registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+    // restart init verification and disable GL for this round
+    is_init_success_ = false;
+    init_match_count_ = 0;
+    localization_state_ = 1;
+    recovery_count_multiplier_ = 2;
+    gl_once_gate_ = false;
+    RCLCPP_INFO(get_logger(), "Recovery: pose set to [%.3f, %.3f, %.3f]",
+                new_pos.x(), new_pos.y(), new_pos.z());
+}
+
+
   void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr points_msg) {
     auto start = std::chrono::high_resolution_clock::now();
     updateLidarStatus(true);
@@ -424,6 +455,7 @@ private:
         if (init_match_count_ >= init_match_count_threshold_) {
           is_init_success_ = true;
           localization_state_ = 2;
+          recovery_count_multiplier_ = 1;
           RCLCPP_INFO(get_logger(), "Init Pose Successful!!!");
           init_match_count_ = 0;  // Reset counter
         }
@@ -492,14 +524,28 @@ private:
     auto aligned = pose_estimator->correct(stamp, raw_points_ptr_);
 
     PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
-    if (match_result.is_converged_ && match_result.fitness_score_ < 0.5) {
-      localization_state_ = 3;
-      RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!!");
-    } else {
-      localization_state_ = 4;
-      RCLCPP_INFO(get_logger(), "Continuous Localization may not good!!!");
-    }
+      if (match_result.fitness_score_ > reliable_threshold_) {
+        bad_match_count_++;
+        RCLCPP_WARN(get_logger(), "Bad match count: %d/%d (score: %.3f)",
+                    bad_match_count_, bad__match_count_threshold_, match_result.fitness_score_);
+        if (bad_match_count_ >= bad__match_count_threshold_ * recovery_count_multiplier_) {
+          bad_match_count_ = 0;
+          make_recovery();
+        }
+      } else {
+        bad_match_count_ = 0;
+      }
 
+      if (match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_)
+        {
+        localization_state_ = 3;
+        RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!! %f",match_result.fitness_score_ );
+        } 
+      else 
+        {
+          localization_state_ = 4;
+          RCLCPP_INFO(get_logger(), "Continuous Localization may not good!!! %f", match_result.fitness_score_);
+        }
     auto end = std::chrono::high_resolution_clock::now();
     last_timeout_ = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     if (last_timeout_ > 80) {
@@ -514,7 +560,7 @@ private:
       aligned_pub->publish(aligned_msg);
     }
     // Update pose history for extrapolation
-    if (match_result.is_converged_ && match_result.fitness_score_ < 0.5) {
+    if (match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_) { /// was 0.5
       Eigen::Matrix4f current_pose = pose_estimator->matrix();
       Eigen::Vector3f current_velocity = getCurrentVelocity(current_pose, points_msg->header.stamp);
       Eigen::Vector3f current_angular_velocity = getCurrentAngularVelocity(current_pose, points_msg->header.stamp);
@@ -583,21 +629,21 @@ private:
   }
 
   void publish_odometry(const rclcpp::Time& stamp, const Eigen::Matrix4f& pose) {
-    RCLCPP_INFO(
-      get_logger(),
-      "[publish_odometry] stamp_ns=%ld now_ns=%ld send_tf_transforms=%s frame_id=%s child_frame_id=%s pose_xyz=[%.3f, %.3f, %.3f]",
-      static_cast<long>(stamp.nanoseconds()),
-      static_cast<long>(get_clock()->now().nanoseconds()),
-      send_tf_transforms ? "true" : "false",
-      robot_odom_frame_id.c_str(),
-      localization_odom_frame_id.c_str(),
-      pose(0, 3), pose(1, 3), pose(2, 3));
+    // RCLCPP_INFO(
+    //   get_logger(),
+    //   "[publish_odometry] stamp_ns=%ld now_ns=%ld send_tf_transforms=%s frame_id=%s child_frame_id=%s pose_xyz=[%.3f, %.3f, %.3f]",
+    //   static_cast<long>(stamp.nanoseconds()),
+    //   static_cast<long>(get_clock()->now().nanoseconds()),
+    //   send_tf_transforms ? "true" : "false",
+    //   robot_odom_frame_id.c_str(),
+    //   localization_odom_frame_id.c_str(),
+    //   pose(0, 3), pose(1, 3), pose(2, 3));
     if (send_tf_transforms) {
       if (tf_buffer->canTransform(robot_odom_frame_id, odom_child_frame_id, rclcpp::Time((int64_t)0, get_clock()->get_clock_type()))) {
-        RCLCPP_INFO(
-          get_logger(),
-          "[publish_odometry] canTransform(%s <- %s) = true",
-          robot_odom_frame_id.c_str(), odom_child_frame_id.c_str());
+        // RCLCPP_INFO(
+        //   get_logger(),
+        //   "[publish_odometry] canTransform(%s <- %s) = true",
+        //   robot_odom_frame_id.c_str(), odom_child_frame_id.c_str());
         geometry_msgs::msg::TransformStamped map_wrt_frame = tf2::eigenToTransform(Eigen::Isometry3d(pose.inverse().cast<double>()));
         map_wrt_frame.header.stamp = stamp;
         map_wrt_frame.header.frame_id = odom_child_frame_id;
@@ -834,6 +880,8 @@ private:
   void updatePoseHistory(const Eigen::Matrix4f& pose, const Eigen::Vector3f& velocity, 
                          const Eigen::Vector3f& angular_velocity, const rclcpp::Time& current_time) {
     last_pose_ = pose;
+    last_reliable_pose_ = pose;
+    has_reliable_pose_ = true;
     last_velocity_ = velocity;
     last_angular_velocity_ = angular_velocity;
     last_valid_pose_time_ = current_time;
@@ -1447,6 +1495,8 @@ private:
   Eigen::Vector3f last_velocity_{0.0, 0.0, 0.0};           // Previous velocity
   Eigen::Vector3f last_angular_velocity_{0.0, 0.0, 0.0};   // Previous angular velocity
   Eigen::Matrix4f last_pose_{Eigen::Matrix4f::Identity()};  // Previous pose matrix
+  Eigen::Matrix4f last_reliable_pose_{Eigen::Matrix4f::Identity()};
+  bool has_reliable_pose_ = false;
   rclcpp::Time last_valid_pose_time_;                        // Time of last valid pose
   bool has_valid_pose_history_ = false;                      // Whether valid pose history exists
   

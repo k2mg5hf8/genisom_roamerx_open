@@ -1,7 +1,7 @@
 collision_monitor:
   ros__parameters:
-    use_sim_time: True
-    base_frame_id: "base_footprint"
+    use_sim_time: False
+    base_frame_id: "base_link"
     odom_frame_id: "odom"
     cmd_vel_in_topic: "cmd_vel_raw"
     cmd_vel_out_topic: "cmd_vel"
@@ -41,14 +41,10 @@ collision_monitor:
       max_points: 5
       visualize: False
       enabled: True
-    observation_sources: ["scan"]
-    scan:
-      type: "scan"
-      topic: "/scan"
-      enabled: True
-    pointcloud:
+    observation_sources: ["lidar"]
+    lidar:
       type: "pointcloud"
-      topic: "/intel_realsense_r200_depth/points"
-      min_height: 0.1
-      max_height: 0.5
+      topic: "/front_lidar"
+      min_height: 0.05
+      max_height: 2.0
       enabled: True

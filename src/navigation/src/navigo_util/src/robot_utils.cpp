@@ -32,11 +32,11 @@ bool getCurrentPose(
   const rclcpp::Time stamp)
 {
   static rclcpp::Logger logger = rclcpp::get_logger("getCurrentPose");
-  RCLCPP_INFO(
-    logger,
-    "[getCurrentPose] global_frame=%s robot_frame=%s stamp_ns=%ld timeout=%.3f",
-    global_frame.c_str(), robot_frame.c_str(), static_cast<long>(stamp.nanoseconds()),
-    transform_timeout);
+  // RCLCPP_INFO(
+  //   logger,
+  //   "[getCurrentPose] global_frame=%s robot_frame=%s stamp_ns=%ld timeout=%.3f",
+  //   global_frame.c_str(), robot_frame.c_str(), static_cast<long>(stamp.nanoseconds()),
+  //   transform_timeout);
   tf2::toMsg(tf2::Transform::getIdentity(), global_pose.pose);
   global_pose.header.frame_id = robot_frame;
   global_pose.header.stamp = stamp;
@@ -52,12 +52,12 @@ bool transformPoseInTargetFrame(
   const double transform_timeout)
 {
   static rclcpp::Logger logger = rclcpp::get_logger("transformPoseInTargetFrame");
-  RCLCPP_INFO(
-    logger,
-    "[transformPoseInTargetFrame] source=%s target=%s stamp_ns=%ld timeout=%.3f",
-    input_pose.header.frame_id.c_str(), target_frame.c_str(),
-    static_cast<long>(static_cast<long long>(input_pose.header.stamp.sec) * 1000000000LL + input_pose.header.stamp.nanosec),
-    transform_timeout);
+  // RCLCPP_INFO(
+  //   logger,
+  //   "[transformPoseInTargetFrame] source=%s target=%s stamp_ns=%ld timeout=%.3f",
+  //   input_pose.header.frame_id.c_str(), target_frame.c_str(),
+  //   static_cast<long>(static_cast<long long>(input_pose.header.stamp.sec) * 1000000000LL + input_pose.header.stamp.nanosec),
+  //   transform_timeout);
 
   try {
     transformed_pose = tf_buffer.transform(

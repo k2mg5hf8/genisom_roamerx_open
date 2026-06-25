@@ -35,6 +35,6 @@ def generate_launch_description():
             name='lidar_tf',
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments=['0.0', '0.0', '0.0', '0', '0', '0', '1', 'odom', 'livox_frame']
+            arguments=['0.0', '0.0', '0.0', '0', '0', '0', '1', 'base_link', 'livox_frame']
         )
     ]) 

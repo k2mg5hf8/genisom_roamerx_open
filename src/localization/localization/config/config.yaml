@@ -1,8 +1,8 @@
 localization:
   ros__parameters:
     # basic parameters
-    points_topic: "/livox/lidar"
-    imu_topic: "/livox/imu"
+    points_topic: "/front_lidar"
+    imu_topic: "/front_lidar/imu"
     localization_odom_frame_id: "base_link"
     
     # topic name
