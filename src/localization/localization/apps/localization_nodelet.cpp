@@ -256,13 +256,20 @@ private:
   float imu_init_max_acce_var_ = 0.2f;
   // Initial pose initialization parameters
   int init_match_count_threshold_ = 5;
-  int bad__match_count_threshold_ = init_match_count_threshold_ * 2;
+  int bad__match_count_threshold_ = 2;
   float init_match_score_threshold_ = 0.2f;
   float reliable_threshold_ = 0.1f;
   // Initial pose initialization state variables
   int init_match_count_ = 0;
   int bad_match_count_ = 0;
   int recovery_count_multiplier_ = 1;
+  // Cooldown between expensive candidate sweeps. make_recovery() itself can
+  // still fire as often as bad_match_count_ allows - it's cheap (just resets
+  // pose_estimator to the last known-good pose). Only the candidate search
+  // inside it is gated, so repeated recoveries during cooldown don't each
+  // cost ~1-2s of blocking.
+  rclcpp::Time last_recovery_search_time_{0, 0, RCL_ROS_TIME};
+  double recovery_search_cooldown_sec_ = 5.0;
   pcl::Registration<PointT, PointT>::Ptr create_registration() {
     if (reg_method == "NDT_OMP") {
       RCLCPP_INFO(get_logger(), "NDT_OMP is selected");
@@ -367,8 +374,35 @@ private:
         RCLCPP_WARN(get_logger(), "Recovery: no reliable pose saved yet, cannot recover");
         return;
     }
+
     Eigen::Vector3f    new_pos  = last_reliable_pose_.block<3, 1>(0, 3);
     Eigen::Quaternionf new_quat(last_reliable_pose_.block<3, 3>(0, 0));
+
+    // Try a candidate sweep around the last reliable pose - but only if we're
+    // past the cooldown since the last sweep. During cooldown, just snap back
+    // to the last reliable pose instantly (cheap, like the old behavior) -
+    // this is what prevents repeated ~1-2s blocking sweeps from stacking up.
+    double since_last_search = (get_clock()->now() - last_recovery_search_time_).seconds();
+    if (since_last_search < recovery_search_cooldown_sec_) {
+      RCLCPP_WARN(get_logger(),
+        "Recovery: search on cooldown (%.1f/%.1f sec), reusing last reliable pose without search",
+        since_last_search, recovery_search_cooldown_sec_);
+    } else if (global_localization_ptr_ && global_map_points_ptr_ && !global_map_points_ptr_->empty() &&
+        raw_points_ptr_ && !raw_points_ptr_->empty()) {
+      last_recovery_search_time_ = get_clock()->now();
+      Eigen::Matrix4d initial_trans = last_reliable_pose_.cast<double>();
+      Eigen::Matrix4d recovered_pose;
+      if (global_localization_ptr_->recoveryLocalization(
+            global_map_points_ptr_, raw_points_ptr_, initial_trans, recovered_pose)) {
+        new_pos  = recovered_pose.block<3, 1>(0, 3).cast<float>();
+        new_quat = Eigen::Quaternionf(recovered_pose.block<3, 3>(0, 0).cast<float>());
+        RCLCPP_INFO(get_logger(), "Recovery: candidate sweep found a better pose");
+      } else {
+        RCLCPP_WARN(get_logger(), "Recovery: candidate sweep found nothing, using last reliable pose as-is");
+      }
+    } else {
+      RCLCPP_WARN(get_logger(), "Recovery: candidate sweep unavailable (no map/cloud yet), using last reliable pose as-is");
+    }
 
     last_init_pos_ = new_pos;
     last_init_quat_ = new_quat;
@@ -380,7 +414,7 @@ private:
     is_init_success_ = false;
     init_match_count_ = 0;
     localization_state_ = 1;
-    recovery_count_multiplier_ = 2;
+    recovery_count_multiplier_ = 8;
     gl_once_gate_ = false;
     RCLCPP_INFO(get_logger(), "Recovery: pose set to [%.3f, %.3f, %.3f]",
                 new_pos.x(), new_pos.y(), new_pos.z());
@@ -475,8 +509,14 @@ private:
       auto imu_iter = imu_data.begin();
       int num = 0;
       for (imu_iter; imu_iter != imu_data.end(); imu_iter++) {
+        
         if (rclcpp::Time(stamp) < rclcpp::Time((*imu_iter)->header.stamp)) {
           break;
+        }
+        float time_diff = (rclcpp::Time(stamp) - rclcpp::Time((*imu_iter)->header.stamp)).seconds();
+        if (time_diff > 0.2) {
+          RCLCPP_WARN(get_logger(), "IMU data is too old: %.3f seconds, skipping this IMU data", time_diff);
+          continue;
         }
         num++;
         if (!(num % imu_data_filter_num_)) {
@@ -525,7 +565,9 @@ private:
 
     PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
       if (match_result.fitness_score_ > reliable_threshold_) {
+
         bad_match_count_++;
+
         RCLCPP_WARN(get_logger(), "Bad match count: %d/%d (score: %.3f)",
                     bad_match_count_, bad__match_count_threshold_, match_result.fitness_score_);
         if (bad_match_count_ >= bad__match_count_threshold_ * recovery_count_multiplier_) {
@@ -539,8 +581,10 @@ private:
       if (match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_)
         {
         localization_state_ = 3;
-        RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!! %f",match_result.fitness_score_ );
-        } 
+        Eigen::Vector3f cur_pos = pose_estimator->matrix().block<3, 1>(0, 3);
+        RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!! %f pos=[%.3f, %.3f, %.3f]",
+                    match_result.fitness_score_, cur_pos.x(), cur_pos.y(), cur_pos.z());
+        }
       else 
         {
           localization_state_ = 4;
@@ -703,12 +747,12 @@ private:
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
     pose_pub->publish(odom);
-    RCLCPP_INFO(
-      get_logger(),
-      "[publish_odometry] published odom header_ns=%ld frame_id=%s child_frame_id=%s",
-      static_cast<long>(static_cast<long long>(odom.header.stamp.sec) * 1000000000LL + odom.header.stamp.nanosec),
-      odom.header.frame_id.c_str(),
-      odom.child_frame_id.c_str());
+    // RCLCPP_INFO(
+    //   get_logger(),
+    //   "[publish_odometry] published odom header_ns=%ld frame_id=%s child_frame_id=%s",
+    //   static_cast<long>(static_cast<long long>(odom.header.stamp.sec) * 1000000000LL + odom.header.stamp.nanosec),
+    //   odom.header.frame_id.c_str(),
+    //   odom.child_frame_id.c_str());
   }
 
   /**

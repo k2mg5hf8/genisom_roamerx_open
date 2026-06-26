@@ -87,6 +87,10 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
   }
 
   double dt = (stamp - prev_stamp).seconds();
+  if (dt > 0.3) {           
+    prev_stamp = stamp;
+    return;                 
+  }
   if (dt > 0.1){
     dt = 0.1;
   } else if (dt < 0.0) {
