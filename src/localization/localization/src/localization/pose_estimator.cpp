@@ -87,12 +87,12 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
   }
 
   double dt = (stamp - prev_stamp).seconds();
-  if (dt > 0.3) {           
+  if (dt > 0.1) {           
     prev_stamp = stamp;
     return;                 
   }
-  if (dt > 0.1){
-    dt = 0.1;
+  if (dt > 0.05){
+    dt = 0.05;
   } else if (dt < 0.0) {
     RCLCPP_INFO(rclcpp::get_logger("PoseEstimator"), "dt < 0.0, not predict!");
     return;
@@ -107,6 +107,7 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
   control.tail<3>() = gyro;
   
   ukf->predict(control);
+  
 }
 
 void PoseEstimator::set_initial_biases(const Eigen::Vector3f& acc_bias, const Eigen::Vector3f& gyro_bias){
@@ -221,6 +222,30 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
     q.coeffs() *= -1.0f;
   }
 
+  float xy_jump = (p.head<2>() - init_guess.block<2, 1>(0, 3)).norm();
+  if (xy_jump > max_xy_jump_) {
+    RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"),
+      "NDT XY jump too large: %.3f m, rejecting observation", xy_jump);
+    match_result_.is_converged_ = false;
+    match_result_.fitness_score_ = 999.0f;
+    return aligned;
+  }
+
+  float max_delta_z = 0.15;
+  if (std::abs(p.z() - init_guess(2,3)) > max_delta_z ){
+    RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"), "Z position change too large: %.3f m, limiting to %.3f m", std::abs(p.z() - init_guess(2,3)), max_delta_z);
+    p.z() = init_guess(2,3) + (p.z() > init_guess(2,3) ? max_delta_z : -max_delta_z);
+  }
+
+  if (p(2) < -0.2 ) {
+    RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"), "Z position out of bounds: %f", p(2));
+    p(2) =  -0.2;
+  }
+  if (p(2) > 1.0 ) {
+    RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"), "Z position out of bounds: %f", p(2));
+    p(2) =  1.0;
+  }
+  
   Eigen::VectorXf observation(7);
   observation.middleRows(0, 3) = p;
   observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
@@ -229,6 +254,7 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(const rclcpp:
   // wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
 
   ukf->correct(observation);
+  ukf->mean[5] = 0.0f; 
   // imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
 
   if(odom_ukf) {

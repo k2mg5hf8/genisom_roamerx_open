@@ -100,7 +100,10 @@ public:
   // IMU bias setters (used after static IMU initialization)
   void set_initial_biases(const Eigen::Vector3f& acc_bias, const Eigen::Vector3f& gyro_bias);
 
+  void set_max_xy_jump(float v) { max_xy_jump_ = v; }
+
 private:
+  float max_xy_jump_ = 5.0f;
   rclcpp::Time init_stamp;             // when the estimator was initialized
   rclcpp::Time prev_stamp;             // when the estimator was updated last time
   rclcpp::Time last_correction_stamp;  // when the estimator performed the correction step
@@ -117,7 +120,6 @@ private:
   boost::optional<Eigen::Matrix4f> odom_pred_error;
 
   pcl::Registration<PointT, PointT>::Ptr registration;
-
   rclcpp::Logger logger_ = rclcpp::get_logger("pose_estimator");  ///< The logger instance.
   };
 

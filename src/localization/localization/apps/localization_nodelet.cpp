@@ -376,6 +376,7 @@ private:
     }
 
     Eigen::Vector3f    new_pos  = last_reliable_pose_.block<3, 1>(0, 3);
+    new_pos(2) = 0;
     Eigen::Quaternionf new_quat(last_reliable_pose_.block<3, 3>(0, 0));
 
     // Try a candidate sweep around the last reliable pose - but only if we're
@@ -387,16 +388,48 @@ private:
       RCLCPP_WARN(get_logger(),
         "Recovery: search on cooldown (%.1f/%.1f sec), reusing last reliable pose without search",
         since_last_search, recovery_search_cooldown_sec_);
-    } else if (global_localization_ptr_ && global_map_points_ptr_ && !global_map_points_ptr_->empty() &&
+    } else if (global_localization_ptr_ && registration && global_map_points_ptr_ && !global_map_points_ptr_->empty() &&
         raw_points_ptr_ && !raw_points_ptr_->empty()) {
+      // Sweep candidates using `registration` (the same NDT object the live
+      // tracker uses) instead of a separate ICP - its target (global map) was
+      // already built once at map-load time, so no rebuild cost per candidate,
+      // and NDT has a wider convergence basin than point-to-point ICP.
       last_recovery_search_time_ = get_clock()->now();
       Eigen::Matrix4d initial_trans = last_reliable_pose_.cast<double>();
-      Eigen::Matrix4d recovered_pose;
-      if (global_localization_ptr_->recoveryLocalization(
-            global_map_points_ptr_, raw_points_ptr_, initial_trans, recovered_pose)) {
-        new_pos  = recovered_pose.block<3, 1>(0, 3).cast<float>();
-        new_quat = Eigen::Quaternionf(recovered_pose.block<3, 3>(0, 0).cast<float>());
-        RCLCPP_INFO(get_logger(), "Recovery: candidate sweep found a better pose");
+      std::vector<Eigen::Matrix4d> candidates = global_localization_ptr_->generateCandidates(initial_trans);
+
+      bool found = false;
+      double best_score = 1000.0;  // NDT fitness here is always well under 1.0
+      Eigen::Matrix4d best_pose = Eigen::Matrix4d::Identity();
+
+      registration->setInputSource(raw_points_ptr_);
+      for (auto& cand : candidates) {
+        pcl::PointCloud<PointT> aligned;
+        registration->align(aligned, cand.cast<float>());
+
+        if (!registration->hasConverged()) {
+          continue;
+        }
+        double score = registration->getFitnessScore();
+        if (score > 0.25) {
+          continue;
+        }
+
+        Eigen::Matrix4d candidate_pose = registration->getFinalTransformation().cast<double>();
+        if (score < best_score) {
+          found = true;
+          best_score = score;
+          best_pose = candidate_pose;
+        }
+        if (best_score < 0.03) {
+          break;  // already excellent, stop searching further candidates
+        }
+      }
+
+      if (found) {
+        new_pos  = best_pose.block<3, 1>(0, 3).cast<float>();
+        new_quat = Eigen::Quaternionf(best_pose.block<3, 3>(0, 0).cast<float>());
+        RCLCPP_INFO(get_logger(), "Recovery: candidate sweep (NDT) found pose, score=%.4f", best_score);
       } else {
         RCLCPP_WARN(get_logger(), "Recovery: candidate sweep found nothing, using last reliable pose as-is");
       }
@@ -405,19 +438,24 @@ private:
     }
 
     last_init_pos_ = new_pos;
+    float z = new_pos(2) ;
+    new_pos(2) = 0.0; 
     last_init_quat_ = new_quat;
     has_set_init_pose_ = true;
     last_pose_source_ = "Recovery";   
     pose_estimator.reset(new localization::PoseEstimator(
       registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+    pose_estimator->set_max_xy_jump(5.0f);  // allow NDT to converge from rough pose during init
     // restart init verification and disable GL for this round
     is_init_success_ = false;
     init_match_count_ = 0;
     localization_state_ = 1;
     recovery_count_multiplier_ = 8;
     gl_once_gate_ = false;
-    RCLCPP_INFO(get_logger(), "Recovery: pose set to [%.3f, %.3f, %.3f]",
-                new_pos.x(), new_pos.y(), new_pos.z());
+    Eigen::Matrix3f rot =  new_quat.toRotationMatrix().cast<float>();
+    float angle = std::atan2(rot(1, 0), rot(0, 0))/M_PI * 180.0f; // Convert to degrees
+    RCLCPP_INFO(get_logger(), "Recovery: pose set to [%.3f, %.3f, %.3f] angle=[%.3f]",
+                new_pos.x(), new_pos.y(), z, angle);
 }
 
 
@@ -490,15 +528,23 @@ private:
           is_init_success_ = true;
           localization_state_ = 2;
           recovery_count_multiplier_ = 1;
+          pose_estimator->set_max_xy_jump(0.3f);  // tighten jump check after init
           RCLCPP_INFO(get_logger(), "Init Pose Successful!!!");
+          Eigen::Vector3f cur_pos = pose_estimator->matrix().block<3, 1>(0, 3);
+          Eigen::Matrix3f cur_rot = pose_estimator->matrix().block<3, 3>(0, 0);
+          float angle = std::atan2(cur_rot(1, 0), cur_rot(0, 0))/M_PI * 180.0f; // Convert to degrees
+          RCLCPP_INFO(get_logger(), "Init with this pose!!! %f pos=[%.3f, %.3f, %.3f] angle=[%.3f]",
+                      init_result.fitness_score_ , cur_pos.x(), cur_pos.y(), cur_pos.z(), angle);
           init_match_count_ = 0;  // Reset counter
         }
       } else {
         init_match_count_ = 0;
         RCLCPP_INFO(get_logger(), "Init match criteria not met, resetting counter");
       }
+
       RCLCPP_INFO(get_logger(), "Wait Init Pose!!! Current count: %d/%d", init_match_count_, init_match_count_threshold_);
     }
+    
 
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());  
     // predict
@@ -571,21 +617,39 @@ private:
         RCLCPP_WARN(get_logger(), "Bad match count: %d/%d (score: %.3f)",
                     bad_match_count_, bad__match_count_threshold_, match_result.fitness_score_);
         if (bad_match_count_ >= bad__match_count_threshold_ * recovery_count_multiplier_) {
+          localization_state_ = 1;
           bad_match_count_ = 0;
+          robots_dog_msgs::msg::Localization msg;
+          msg.header.stamp = this->get_clock()->now();
+          msg.header.frame_id = "map";
+          msg.type = "loc_state";
+          msg.status = 0;
+          msg.coord_type = is_use_map_coord_ ? 0 : 1;
+          msg.pos.x = msg.pos.y = msg.pos.z = 0.0;
+          msg.rpy.x = msg.rpy.y = msg.rpy.z = 0.0;
+          msg.vel.x = msg.vel.y = msg.vel.z = 0.0;
+          msg.acc.x = msg.acc.y = msg.acc.z = 0.0;
+          msg.gyro.x = msg.gyro.y = msg.gyro.z = 0.0;
+          msg.speed = 0.0;
+          current_confidence_ = 0.0;
+          localization_info_pub_->publish(msg);
+          
           make_recovery();
         }
       } else {
         bad_match_count_ = 0;
       }
 
-      if (match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_)
+      if (is_init_success_ && match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_)
         {
         localization_state_ = 3;
         Eigen::Vector3f cur_pos = pose_estimator->matrix().block<3, 1>(0, 3);
-        RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!! %f pos=[%.3f, %.3f, %.3f]",
-                    match_result.fitness_score_, cur_pos.x(), cur_pos.y(), cur_pos.z());
+        Eigen::Matrix3f cur_rot = pose_estimator->matrix().block<3, 3>(0, 0);
+        float angle = std::atan2(cur_rot(1, 0), cur_rot(0, 0))/M_PI * 180.0f; // Convert to degrees
+        RCLCPP_INFO(get_logger(), "Continuous Localization Successful!!! %f pos=[%.3f, %.3f, %.3f] angle=[%.3f]",
+                    match_result.fitness_score_, cur_pos.x(), cur_pos.y(), cur_pos.z(), angle);
         }
-      else 
+      else
         {
           localization_state_ = 4;
           RCLCPP_INFO(get_logger(), "Continuous Localization may not good!!! %f", match_result.fitness_score_);
@@ -604,7 +668,7 @@ private:
       aligned_pub->publish(aligned_msg);
     }
     // Update pose history for extrapolation
-    if (match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_) { /// was 0.5
+    if (is_init_success_ && match_result.is_converged_ && match_result.fitness_score_ < reliable_threshold_) {
       Eigen::Matrix4f current_pose = pose_estimator->matrix();
       Eigen::Vector3f current_velocity = getCurrentVelocity(current_pose, points_msg->header.stamp);
       Eigen::Vector3f current_angular_velocity = getCurrentAngularVelocity(current_pose, points_msg->header.stamp);
@@ -648,6 +712,7 @@ private:
       last_pose_source_ = "Callback";   
       pose_estimator.reset(new localization::PoseEstimator(
         registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
+      pose_estimator->set_max_xy_jump(5.0f);  // allow NDT to converge from rough pose during init
       // restart init verification and disable GL for this round
       is_init_success_ = false;
       init_match_count_ = 0;
