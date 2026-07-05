@@ -194,12 +194,18 @@ public:
                 imu_init_max_acce_var_);
 
     global_map_points_ptr_.reset(new pcl::PointCloud<PointT>());
+
+
     if (use_imu) {
+      auto imu_group = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+      rclcpp::SubscriptionOptions imu_options;
+      imu_options.callback_group = imu_group;
       RCLCPP_INFO(get_logger(), "enable imu-based prediction");
       correct_imu_data_ptr_ = std::make_shared<sensor_msgs::msg::Imu>();
-      imu_sub               = create_subscription<sensor_msgs::msg::Imu>(imu_topic, 256, std::bind(&HdlLocalizationNode::imu_callback, this, std::placeholders::_1));
+      imu_sub               = create_subscription<sensor_msgs::msg::Imu>(imu_topic, 128, std::bind(&HdlLocalizationNode::imu_callback, this, std::placeholders::_1), imu_options);
     }
-    points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 5, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
+
+    points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 2, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
     initialpose_sub =
       create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 8, std::bind(&HdlLocalizationNode::initialpose_callback, this, std::placeholders::_1));
 
@@ -269,7 +275,7 @@ private:
   // inside it is gated, so repeated recoveries during cooldown don't each
   // cost ~1-2s of blocking.
   rclcpp::Time last_recovery_search_time_{0, 0, RCL_ROS_TIME};
-  double recovery_search_cooldown_sec_ = 5.0;
+  double recovery_search_cooldown_sec_ = 3.0;
   pcl::Registration<PointT, PointT>::Ptr create_registration() {
     if (reg_method == "NDT_OMP") {
       RCLCPP_INFO(get_logger(), "NDT_OMP is selected");
@@ -343,9 +349,10 @@ private:
 
 private:
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr imu_msg) {
+    std::lock_guard<std::mutex> lock(imu_data_mutex);  // whole function - correct_imu_data_ptr_/latest_angular_velocity_ are read on other threads now
     correct_imu_data_ptr_ = imu_msg;
     Eigen::Vector3f acceleration(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z);
-    // Apply rotation matrix and gravity compensation 
+    // Apply rotation matrix and gravity compensation
     acceleration = init_rotation_matrix_ * acceleration * 9.81;
     correct_imu_data_ptr_->linear_acceleration.x = acceleration.x();
     correct_imu_data_ptr_->linear_acceleration.y = acceleration.y();
@@ -362,8 +369,7 @@ private:
     if (!static_imu_init_.InitSuccess()) {
       static_imu_init_.AddIMUData(correct_imu_data_ptr_);
     } else {
-      std::lock_guard<std::mutex> lock(imu_data_mutex);
-      imu_data.push_back(correct_imu_data_ptr_);
+      imu_data.push_back(correct_imu_data_ptr_);  // already under imu_data_mutex above
     }
   }
 
@@ -417,7 +423,15 @@ private:
 
         Eigen::Matrix4d candidate_pose = registration->getFinalTransformation().cast<double>();
         if (score < best_score) {
+          double dist = (candidate_pose.block<2,1>(0,3)- cand.block<2,1>(0,3) ).norm();
+          if (dist > 0.7){
+              RCLCPP_INFO(get_logger(), "Recovery: candidate is too far away, dist=%.4f", dist);
+              continue;
+          }
+        
+            
           found = true;
+
           best_score = score;
           best_pose = candidate_pose;
         }
@@ -497,7 +511,8 @@ private:
     auto filtered = downsample(raw_points_ptr_);
     TransformPoints(filtered, raw_points_ptr_);
     // last_scan = filtered;
-    
+    auto t_downsample = std::chrono::high_resolution_clock::now();
+
     if (use_global_localization_init_ && gl_once_gate_ && global_localization_ptr_ && !is_init_success_) {
       RCLCPP_INFO(get_logger(), "Attempting global localization for better initial pose...");
       if (performGlobalLocalization(raw_points_ptr_)) {
@@ -576,6 +591,7 @@ private:
       }
       imu_data.erase(imu_data.begin(), imu_iter);
     }
+    auto t_predict = std::chrono::high_resolution_clock::now();
 
     // odometry-based prediction
     rclcpp::Time last_correction_time = pose_estimator->last_correction_time();
@@ -608,6 +624,7 @@ private:
     }
     // correct
     auto aligned = pose_estimator->correct(stamp, raw_points_ptr_);
+    auto t_correct = std::chrono::high_resolution_clock::now();
 
     PoseEstimator::MatchResult match_result = pose_estimator->GetMatchState();
       if (match_result.fitness_score_ > reliable_threshold_) {
@@ -657,7 +674,12 @@ private:
     auto end = std::chrono::high_resolution_clock::now();
     last_timeout_ = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     if (last_timeout_ > 80) {
-      RCLCPP_INFO(get_logger(), "!!!point cloud callback time cost > 80ms, = %d ms\n", last_timeout_);
+      auto ms = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+      };
+      RCLCPP_INFO(get_logger(),
+        "!!!point cloud callback time cost > 80ms, = %d ms  (downsample+transform=%ld predict=%ld correct=%ld rest=%ld)\n",
+        last_timeout_, ms(start, t_downsample), ms(t_downsample, t_predict), ms(t_predict, t_correct), ms(t_correct, end));
     }
 
     if (aligned_pub->get_subscription_count()) {
@@ -708,6 +730,9 @@ private:
     if (pose_changed) {
       last_init_pos_ = new_pos;
       last_init_quat_ = new_quat;
+      last_reliable_pose_.block<3,3>(0,0) = new_quat.toRotationMatrix();
+      last_reliable_pose_.block<3,1>(0,3) = new_pos;
+      has_reliable_pose_ = true;
       has_set_init_pose_ = true;
       last_pose_source_ = "Callback";   
       pose_estimator.reset(new localization::PoseEstimator(
@@ -922,6 +947,7 @@ private:
    */
   bool isImuDataValid() {
     if (!use_imu) { return false; }
+    std::lock_guard<std::mutex> lock(imu_data_mutex);  // imu_status_buffer_ written from imu_group thread
     if (imu_status_buffer_.size() < min_valid_count_) { return false; }
     int valid_count = std::count(imu_status_buffer_.begin(), imu_status_buffer_.end(), true);
     return valid_count >= min_valid_count_;
@@ -1026,8 +1052,11 @@ private:
    * @return current angular velocity
    */
   Eigen::Vector3f getCurrentAngularVelocity(const Eigen::Matrix4f& current_pose, const rclcpp::Time& current_time) {
-    if (latest_angular_velocity_.norm() > 0.0) {
-      return latest_angular_velocity_;
+    {
+      std::lock_guard<std::mutex> lock(imu_data_mutex);  // latest_angular_velocity_ written from imu_group thread
+      if (latest_angular_velocity_.norm() > 0.0) {
+        return latest_angular_velocity_;
+      }
     }
     if (has_valid_pose_history_) {
       double dt = (current_time - last_valid_pose_time_).seconds();
@@ -1054,8 +1083,12 @@ private:
     int lidar_total_count = lidar_status_buffer_.size();
     double lidar_valid_ratio = lidar_total_count > 0 ? (double)lidar_valid_count / lidar_total_count : 0.0; 
     // IMU status statistics
-    int imu_valid_count = std::count(imu_status_buffer_.begin(), imu_status_buffer_.end(), true);
-    int imu_total_count = imu_status_buffer_.size();
+    int imu_valid_count, imu_total_count;
+    {
+      std::lock_guard<std::mutex> lock(imu_data_mutex);  // imu_status_buffer_ written from imu_group thread
+      imu_valid_count = std::count(imu_status_buffer_.begin(), imu_status_buffer_.end(), true);
+      imu_total_count = imu_status_buffer_.size();
+    }
     double imu_valid_ratio = imu_total_count > 0 ? (double)imu_valid_count / imu_total_count : 0.0;
     
     ss << "Lidar: " << lidar_valid_count << "/" << lidar_total_count 
@@ -1299,10 +1332,13 @@ private:
                 updateLidarStatus(false);
             }
         }  
-        if (imu_status_buffer_.size() > 0) {
-            double imu_time_diff = (current_time - last_imu_data_time_).seconds();
-            if (imu_time_diff > sensor_timeout_threshold_) {
-                updateImuStatus(false);
+        {
+            std::lock_guard<std::mutex> lock(imu_data_mutex);  // imu_status_buffer_/last_imu_data_time_ written from imu_group thread
+            if (imu_status_buffer_.size() > 0) {
+                double imu_time_diff = (current_time - last_imu_data_time_).seconds();
+                if (imu_time_diff > sensor_timeout_threshold_) {
+                    updateImuStatus(false);
+                }
             }
         }
         robots_dog_msgs::msg::Localization msg;
@@ -1382,8 +1418,13 @@ private:
             msg.rpy.y = rpy(1); // pitch
             msg.rpy.z = rpy(2); // yaw
         }
-        if (correct_imu_data_ptr_) {
-            const auto &imu = *correct_imu_data_ptr_;
+        sensor_msgs::msg::Imu::SharedPtr imu_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(imu_data_mutex);  // correct_imu_data_ptr_ written from imu_group thread
+            imu_snapshot = correct_imu_data_ptr_;
+        }
+        if (imu_snapshot) {
+            const auto &imu = *imu_snapshot;
             msg.acc.x = imu.linear_acceleration.x;
             msg.acc.y = imu.linear_acceleration.y;
             msg.acc.z = imu.linear_acceleration.z;
@@ -1522,12 +1563,17 @@ private:
 
     void Reset() {
         is_init_success_ = false;
-        localization_state_ = 0; 
+        localization_state_ = 0;
         lidar_status_buffer_.clear();
-        imu_status_buffer_.clear();
+        {
+          std::lock_guard<std::mutex> lock(imu_data_mutex);  // imu_status_buffer_ written from imu_group thread
+          imu_status_buffer_.clear();
+          for (int i = 0; i < buffer_size_; i++) {
+            imu_status_buffer_.push_back(false);
+          }
+        }
         for (int i = 0; i < buffer_size_; i++) {
           lidar_status_buffer_.push_back(false);
-          imu_status_buffer_.push_back(false);
         }
         has_valid_pose_history_ = false;
     }
@@ -1559,7 +1605,7 @@ private:
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
 
   // imu input buffer
-  std::mutex imu_data_mutex;
+  mutable std::mutex imu_data_mutex;
   std::vector<sensor_msgs::msg::Imu::ConstSharedPtr> imu_data;
   
   // transformation matrices 
@@ -1657,7 +1703,10 @@ int main(int argc, char** argv) {
   omp_set_num_threads(6);
   rclcpp::init(argc, argv);
   auto node = std::make_shared<localization::HdlLocalizationNode>(rclcpp::NodeOptions());
-  rclcpp::spin(node);
+
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }
