@@ -26,6 +26,7 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     container_name = LaunchConfiguration('container_name')
     container_name_full = (namespace, '/', container_name)
+    lidar_topic = LaunchConfiguration('lidar_topic')
 
     lifecycle_nodes = [
         'map_server',
@@ -37,7 +38,13 @@ def generate_launch_description():
         'waypoint_follower',
     ]
 
-    remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+    # /front_lidar is hardcoded as the obstacle_layer observation source topic in
+    # navigo_params.yaml (local_costmap, lives inside controller_server) - it's a
+    # parameter value, not a name baked into the code, but ROS remapping still
+    # intercepts it at subscription time regardless of where the string came from.
+    # On a robot whose driver natively publishes under a different name (e.g.
+    # /livox/lidar), pass lidar_topic:=... instead of running a topic_tools relay.
+    remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static'), ('/front_lidar', lidar_topic)]
 
     # Create our own temporary YAML files that include substitutions
     param_substitutions = {
@@ -106,6 +113,13 @@ def generate_launch_description():
         'container_name',
         default_value='navigo_container',
         description='the name of conatiner that nodes will load in if use composition',
+    )
+
+    declare_lidar_topic_cmd = DeclareLaunchArgument(
+        'lidar_topic',
+        default_value='/front_lidar',
+        description='Native lidar point cloud topic - remapped to /front_lidar '
+                     '(the obstacle_layer observation source in navigo_params.yaml)',
     )
 
     load_nodes = GroupAction(
@@ -311,6 +325,7 @@ def generate_launch_description():
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
     ld.add_action(declare_container_name_cmd)
+    ld.add_action(declare_lidar_topic_cmd)
     # Add the actions to launch all of the navigation nodes
     ld.add_action(load_nodes)
     ld.add_action(load_composable_nodes)

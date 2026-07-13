@@ -11,15 +11,29 @@ def generate_launch_description():
     # 获取配置文件路径
     localization_dir = get_package_share_directory('localization')
     config_file = os.path.join(localization_dir, 'config', 'config.yaml')
-    
+
+    # Per-robot sensor topic names. Defaults match config.yaml's points_topic/imu_topic,
+    # so on the "native" robot nothing changes. On a robot with different native topic
+    # names (e.g. Livox driver publishing /livox/lidar, /livox/imu), pass these as launch
+    # args instead of running `ros2 run topic_tools relay ...` - remapping happens at
+    # subscription time, no extra process, no duplicated sensor traffic.
+    lidar_topic_arg = DeclareLaunchArgument('lidar_topic', default_value='/front_lidar')
+    imu_topic_arg = DeclareLaunchArgument('imu_topic', default_value='/front_lidar/imu')
+
     return LaunchDescription([
+        lidar_topic_arg,
+        imu_topic_arg,
         # 启动定位节点
         Node(
             package='localization',
             executable='localization_node',
             name='localization',
             output='screen',
-            parameters=[config_file]
+            parameters=[config_file],
+            remappings=[
+                ('/front_lidar', LaunchConfiguration('lidar_topic')),
+                ('/front_lidar/imu', LaunchConfiguration('imu_topic')),
+            ]
         ),
 
         # Node(

@@ -107,6 +107,15 @@ def generate_launch_description():
         description='tf type used for odometry (mujoco_tf or localization_tf)'
     )
 
+    declare_lidar_topic_cmd = DeclareLaunchArgument(
+        'lidar_topic',
+        default_value='/front_lidar',
+        description='Native lidar point cloud topic - remapped to /front_lidar '
+                     '(the obstacle_layer observation source in navigo_params.yaml). '
+                     'Set this instead of running a topic_tools relay on robots whose '
+                     'driver publishes under a different name (e.g. /livox/lidar).'
+    )
+
     set_map = SetLaunchConfiguration(
         'map',
         PythonExpression([
@@ -286,6 +295,7 @@ def generate_launch_description():
             'autostart': autostart,
             'use_composition': use_composition,
             'use_respawn': use_respawn,
+            'lidar_topic': LaunchConfiguration('lidar_topic'),
         }.items(),
     )
 
@@ -307,6 +317,7 @@ def generate_launch_description():
     ld.add_action(declare_mc_controller_type_cmd)
     ld.add_action(declare_communication_type_cmd)
     ld.add_action(declare_tf_type_cmd)
+    ld.add_action(declare_lidar_topic_cmd)
 
     ld.add_action(set_map)
     ld.add_action(set_use_sim_time)

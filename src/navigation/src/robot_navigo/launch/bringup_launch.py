@@ -32,6 +32,7 @@ def generate_launch_description():
     use_composition = LaunchConfiguration('use_composition')
     use_respawn = LaunchConfiguration('use_respawn')
     log_level = LaunchConfiguration('log_level')
+    lidar_topic = LaunchConfiguration('lidar_topic')
 
     remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
 
@@ -100,6 +101,13 @@ def generate_launch_description():
         description='Whether to respawn if a node crashes. Applied when composition is disabled.',
     )
 
+    declare_lidar_topic_cmd = DeclareLaunchArgument(
+        'lidar_topic',
+        default_value='/front_lidar',
+        description='Native lidar point cloud topic - remapped to /front_lidar '
+                     '(the obstacle_layer observation source in navigo_params.yaml)',
+    )
+
     declare_log_level_cmd = DeclareLaunchArgument(
         'log_level', default_value='info', description='log level'
     )
@@ -132,6 +140,7 @@ def generate_launch_description():
                     'use_respawn': use_respawn,
                     'log_level': log_level,
                     'container_name': 'navigo_container',
+                    'lidar_topic': lidar_topic,
                 }.items(),
             ),
         ]
@@ -153,6 +162,7 @@ def generate_launch_description():
     ld.add_action(declare_use_composition_cmd)
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
+    ld.add_action(declare_lidar_topic_cmd)
 
     # Add the actions to launch all of the navigation nodes
     ld.add_action(bringup_cmd_group)
