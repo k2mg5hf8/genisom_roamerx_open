@@ -81,7 +81,7 @@ public:
     // Load numeric parameters
     imu_data_filter_num_      = declare_parameter<int>("imu_data_filter_num", 5);
     globalmap_voxel_size_     = static_cast<float>(declare_parameter<double>("globalmap_voxel_size", 0.3));
-    points_voxel_filter_size_ = static_cast<float>(declare_parameter<double>("points_voxel_filter_size", 0.2));
+    points_voxel_filter_size_ = static_cast<float>(declare_parameter<double>("points_voxel_filter_size", 0.25));
     
     min_valid_count_           = declare_parameter<int>("min_valid_count", 5);
     buffer_size_               = declare_parameter<int>("buffer_size", 10);
@@ -264,7 +264,7 @@ private:
   int init_match_count_threshold_ = 5;
   int bad__match_count_threshold_ = 2;
   float init_match_score_threshold_ = 0.2f;
-  float reliable_threshold_ = 0.1f;
+  float reliable_threshold_ = 0.14f;
   // Initial pose initialization state variables
   int init_match_count_ = 0;
   int bad_match_count_ = 0;
@@ -586,7 +586,6 @@ private:
           double acc_sign = invert_acc ? -1.0 : 1.0;
           double gyro_sign = invert_gyro ? -1.0 : 1.0;
           pose_estimator->predict((*imu_iter)->header.stamp, acc_sign * Eigen::Vector3f(acc.x, acc.y, acc.z), gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
-          publish_odometry((*imu_iter)->header.stamp, pose_estimator->matrix());
         }
       }
       imu_data.erase(imu_data.begin(), imu_iter);
@@ -804,13 +803,9 @@ private:
         odom_trans.child_frame_id = robot_odom_frame_id;
 
         tf_broadcaster->sendTransform(odom_trans);
-        RCLCPP_INFO(
-          get_logger(),
-          "[publish_odometry] broadcast TF map -> %s at stamp_ns=%ld",
-          robot_odom_frame_id.c_str(), static_cast<long>(stamp.nanoseconds()));
       } else {
-        RCLCPP_WARN(
-          get_logger(),
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
           "[publish_odometry] canTransform(%s <- %s) = false, fallback broadcast map -> %s directly",
           robot_odom_frame_id.c_str(), odom_child_frame_id.c_str(), odom_child_frame_id.c_str());
         geometry_msgs::msg::TransformStamped odom_trans = tf2::eigenToTransform(Eigen::Isometry3d(pose.cast<double>()));
@@ -818,10 +813,6 @@ private:
         odom_trans.header.frame_id = "map";
         odom_trans.child_frame_id = odom_child_frame_id;
         tf_broadcaster->sendTransform(odom_trans);
-        RCLCPP_INFO(
-          get_logger(),
-          "[publish_odometry] broadcast fallback TF map -> %s at stamp_ns=%ld",
-          odom_child_frame_id.c_str(), static_cast<long>(stamp.nanoseconds()));
       }
     }
     // publish the transform
@@ -836,6 +827,17 @@ private:
     odom.twist.twist.linear.x = 0.0;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
+    // Реальная скорость из UKF вместо нулей — чтобы MPPI/progress checker знали,
+    // с какой скоростью робот уже едет. UKF хранит скорость в map-фрейме,
+    // а twist в Odometry должен быть в body-фрейме (child_frame_id=base_link),
+    // поэтому поворачиваем через R^T. Guard на pose_estimator обязателен:
+    // publish_odometry вызывается и до его создания (pubDefaultLocalizationOdom).
+    // if (pose_estimator) {
+    //   const Eigen::Matrix3f R = pose.block<3, 3>(0, 0);
+    //   const Eigen::Vector3f vel_body = R.transpose() * pose_estimator->vel();
+    //   odom.twist.twist.linear.x = vel_body.x();
+    //   odom.twist.twist.linear.y = vel_body.y();
+    // }
     pose_pub->publish(odom);
     // RCLCPP_INFO(
     //   get_logger(),

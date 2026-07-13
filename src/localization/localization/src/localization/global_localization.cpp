@@ -21,8 +21,8 @@ std::vector<Eigen::Matrix4d> GlobalLocalization::generateCandidates(const Eigen:
     Eigen::Vector3d init_pos = initial_pose.block<3,1>(0,3);
     Eigen::Matrix3d init_rot = initial_pose.block<3, 3>(0, 0);
     Eigen::Matrix2d init_rot_2d = initial_pose.block<2, 2>(0, 0);
-    std::vector<double> deltas_x = {0.0, 0.2};
-    std::vector<double> deltas_y = {-0.2, 0.0, 0.2};
+    std::vector<double> deltas_x = {0.0, 0.3};
+    std::vector<double> deltas_y = {0.0};
     std::vector<double> deltas_w = {-25.0,  0.0,  25}; // degrees
     std::vector<Eigen::Matrix4d> candidates;
     for (const auto& dx : deltas_x){
