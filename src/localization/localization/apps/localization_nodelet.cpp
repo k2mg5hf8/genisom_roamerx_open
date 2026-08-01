@@ -264,7 +264,7 @@ private:
   int init_match_count_threshold_ = 5;
   int bad__match_count_threshold_ = 2;
   float init_match_score_threshold_ = 0.2f;
-  float reliable_threshold_ = 0.14f;
+  float reliable_threshold_ = 0.2f;
   // Initial pose initialization state variables
   int init_match_count_ = 0;
   int bad_match_count_ = 0;
