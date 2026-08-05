@@ -127,10 +127,13 @@ protected:
   bool isCancelRequested(std::unique_ptr<navigo_util::SimpleActionServer<T>> & action_server);
 
   /**
-   * @brief Wait for costmap to be valid with updated sensor data or repopulate after a
-   * clearing recovery. Blocks until true without timeout.
+   * @brief Wait for the global costmap to become current while remaining cancel-aware.
+   * @param action_server Action server whose cancellation state is checked
+   * @return false when canceled or inactive
+   * @throw std::runtime_error when costmap_update_timeout_ expires
    */
-  void waitForCostmap();
+  template<typename T>
+  bool waitForCostmap(std::unique_ptr<navigo_util::SimpleActionServer<T>> & action_server);
 
   /**
    * @brief Check if an action server has a preemption request and replaces the goal
@@ -141,7 +144,7 @@ protected:
   template<typename T>
   void getPreemptedGoalIfRequested(
     std::unique_ptr<navigo_util::SimpleActionServer<T>> & action_server,
-    typename std::shared_ptr<const typename T::Goal> goal);
+    typename std::shared_ptr<const typename T::Goal> & goal);
 
   /**
    * @brief Get the starting pose from costmap or message, if valid
@@ -235,6 +238,7 @@ protected:
   std::vector<std::string> planner_ids_;
   std::vector<std::string> planner_types_;
   double max_planner_duration_;
+  double costmap_update_timeout_;
   std::string planner_ids_concat_;
 
   // TF buffer

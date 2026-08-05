@@ -60,6 +60,7 @@ ControllerServer::ControllerServer(const rclcpp::NodeOptions & options)
   declare_parameter("speed_limit_topic", rclcpp::ParameterValue("speed_limit"));
 
   declare_parameter("failure_tolerance", rclcpp::ParameterValue(0.0));
+  declare_parameter("costmap_update_timeout", rclcpp::ParameterValue(2.0));
 
   // The costmap node is used in the implementation of the controller
   costmap_ros_ = std::make_shared<navigo_costmap_2d::Costmap2DROS>(
@@ -119,6 +120,11 @@ ControllerServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   std::string speed_limit_topic;
   get_parameter("speed_limit_topic", speed_limit_topic);
   get_parameter("failure_tolerance", failure_tolerance_);
+  get_parameter("costmap_update_timeout", costmap_update_timeout_);
+  if (costmap_update_timeout_ <= 0.0) {
+    RCLCPP_ERROR(get_logger(), "costmap_update_timeout must be greater than 0.0 seconds");
+    return navigo_util::CallbackReturn::FAILURE;
+  }
 
   costmap_ros_->configure();
   // Launch a thread to run the costmap node
@@ -395,10 +401,8 @@ void ControllerServer::computeControl()
         return;
       }
 
-      // Don't compute a trajectory until costmap is valid (after clear costmap)
-      rclcpp::Rate r(100);
-      while (!costmap_ros_->isCurrent()) {
-        r.sleep();
+      if (!waitForCostmap()) {
+        return;
       }
 
       updateGlobalPath();
@@ -435,6 +439,41 @@ void ControllerServer::computeControl()
 
   // TODO(orduno) #861 Handle a pending preemption and set controller name
   action_server_->succeeded_current();
+}
+
+bool ControllerServer::waitForCostmap()
+{
+  const auto started_at = std::chrono::steady_clock::now();
+  rclcpp::WallRate rate(100.0);
+
+  while (rclcpp::ok() && !costmap_ros_->isCurrent()) {
+    if (action_server_ == nullptr || !action_server_->is_server_active()) {
+      RCLCPP_DEBUG(get_logger(), "Controller became inactive while waiting for local costmap");
+      return false;
+    }
+
+    if (action_server_->is_cancel_requested()) {
+      RCLCPP_INFO(get_logger(), "Goal was canceled while waiting for local costmap");
+      action_server_->terminate_all();
+      publishZeroVelocity();
+      return false;
+    }
+
+    const auto elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    if (elapsed >= costmap_update_timeout_) {
+      throw navigo_core::PlannerException(
+              "Timed out waiting for local costmap to become current");
+    }
+
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Waiting for local costmap to become current (%.1f/%.1f s)",
+      elapsed, costmap_update_timeout_);
+    rate.sleep();
+  }
+
+  return rclcpp::ok();
 }
 
 void ControllerServer::setPlannerPath(const nav_msgs::msg::Path & path)
@@ -562,7 +601,7 @@ void ControllerServer::updateGlobalPath()
 void ControllerServer::publishVelocity(const geometry_msgs::msg::TwistStamped & velocity)
 {
   auto cmd_vel = std::make_unique<geometry_msgs::msg::Twist>(velocity.twist);
-  if (vel_publisher_->is_activated() && vel_publisher_->get_subscription_count() > 0) {
+  if (vel_publisher_->is_activated()) {
     vel_publisher_->publish(std::move(cmd_vel));
   }
 }
@@ -657,6 +696,14 @@ ControllerServer::dynamicParametersCallback(std::vector<rclcpp::Parameter> param
         min_theta_velocity_threshold_ = parameter.as_double();
       } else if (name == "failure_tolerance") {
         failure_tolerance_ = parameter.as_double();
+      } else if (name == "costmap_update_timeout") {
+        if (parameter.as_double() <= 0.0) {
+          dynamic_params_lock_.unlock();
+          result.successful = false;
+          result.reason = "costmap_update_timeout must be greater than 0.0 seconds";
+          return result;
+        }
+        costmap_update_timeout_ = parameter.as_double();
       }
     }
 

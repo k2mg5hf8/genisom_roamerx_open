@@ -52,6 +52,7 @@ PlannerServer::PlannerServer(const rclcpp::NodeOptions & options)
   // Declare this node's parameters
   declare_parameter("planner_plugins", default_ids_);
   declare_parameter("expected_planner_frequency", 1.0);
+  declare_parameter("costmap_update_timeout", 2.0);
 
   get_parameter("planner_plugins", planner_ids_);
   if (planner_ids_ == default_ids_) {
@@ -125,6 +126,11 @@ PlannerServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
 
   double expected_planner_frequency = 1.0;
   get_parameter("expected_planner_frequency", expected_planner_frequency);
+  get_parameter("costmap_update_timeout", costmap_update_timeout_);
+  if (costmap_update_timeout_ <= 0.0) {
+    RCLCPP_ERROR(get_logger(), "costmap_update_timeout must be greater than 0.0 seconds");
+    return navigo_util::CallbackReturn::FAILURE;
+  }
   if (expected_planner_frequency > 0) {
     max_planner_duration_ = 1 / expected_planner_frequency;
   } else {
@@ -264,13 +270,36 @@ bool PlannerServer::isServerInactive(
   return false;
 }
 
-void PlannerServer::waitForCostmap()
+template<typename T>
+bool PlannerServer::waitForCostmap(
+  std::unique_ptr<navigo_util::SimpleActionServer<T>> & action_server)
 {
-  // Don't compute a plan until costmap is valid (after clear costmap)
-  rclcpp::Rate r(100);
-  while (!costmap_ros_->isCurrent()) {
-    r.sleep();
+  const auto started_at = std::chrono::steady_clock::now();
+  rclcpp::WallRate rate(100.0);
+
+  while (rclcpp::ok() && !costmap_ros_->isCurrent()) {
+    if (isServerInactive(action_server)) {
+      return false;
+    }
+
+    if (isCancelRequested(action_server)) {
+      return false;
+    }
+
+    const auto elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    if (elapsed >= costmap_update_timeout_) {
+      throw std::runtime_error("Timed out waiting for global costmap to become current");
+    }
+
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Waiting for global costmap to become current (%.1f/%.1f s)",
+      elapsed, costmap_update_timeout_);
+    rate.sleep();
   }
+
+  return rclcpp::ok();
 }
 
 template<typename T>
@@ -289,7 +318,7 @@ bool PlannerServer::isCancelRequested(
 template<typename T>
 void PlannerServer::getPreemptedGoalIfRequested(
   std::unique_ptr<navigo_util::SimpleActionServer<T>> & action_server,
-  typename std::shared_ptr<const typename T::Goal> goal)
+  typename std::shared_ptr<const typename T::Goal> & goal)
 {
   if (action_server->is_preempt_requested()) {
     goal = action_server->accept_pending_goal();
@@ -372,7 +401,9 @@ PlannerServer::computePlanThroughPoses()
       return;
     }
 
-    waitForCostmap();
+    if (!waitForCostmap(action_server_poses_)) {
+      return;
+    }
 
     getPreemptedGoalIfRequested(action_server_poses_, goal);
 
@@ -463,7 +494,9 @@ PlannerServer::computePlan()
       return;
     }
 
-    waitForCostmap();
+    if (!waitForCostmap(action_server_pose_)) {
+      return;
+    }
 
     getPreemptedGoalIfRequested(action_server_pose_, goal);
 
@@ -621,6 +654,13 @@ PlannerServer::dynamicParametersCallback(std::vector<rclcpp::Parameter> paramete
             " than 0.0 to turn on duration overrrun warning messages", parameter.as_double());
           max_planner_duration_ = 0.0;
         }
+      } else if (name == "costmap_update_timeout") {
+        if (parameter.as_double() <= 0.0) {
+          result.successful = false;
+          result.reason = "costmap_update_timeout must be greater than 0.0 seconds";
+          return result;
+        }
+        costmap_update_timeout_ = parameter.as_double();
       }
     }
   }

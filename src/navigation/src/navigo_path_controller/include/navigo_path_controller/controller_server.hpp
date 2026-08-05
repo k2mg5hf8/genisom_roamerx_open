@@ -125,6 +125,16 @@ protected:
   void computeControl();
 
   /**
+   * @brief Wait for the local costmap to become current.
+   *
+   * The wait is bounded by costmap_update_timeout_ and remains responsive to
+   * action cancellation and lifecycle shutdown.
+   * @return false when the action was canceled or the server became inactive
+   * @throw navigo_core::PlannerException when the timeout expires
+   */
+  bool waitForCostmap();
+
+  /**
    * @brief Find the valid controller ID name for the given request
    *
    * @param c_name The requested controller name
@@ -254,6 +264,7 @@ protected:
   double min_theta_velocity_threshold_;
 
   double failure_tolerance_;
+  double costmap_update_timeout_;
 
   // Whether we've published the single controller warning yet
   geometry_msgs::msg::PoseStamped end_pose_;

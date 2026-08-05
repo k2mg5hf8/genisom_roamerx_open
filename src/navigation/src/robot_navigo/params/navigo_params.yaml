@@ -188,6 +188,7 @@ map_saver:
 planner_server:
   ros__parameters:
     expected_planner_frequency: 20.0
+    costmap_update_timeout: 2.0
     odom_topic: /odom/localization_odom
     use_sim_time: False
     planner_plugins: ["GridBased"]
@@ -200,6 +201,7 @@ planner_server:
 controller_server:
   ros__parameters:
     controller_frequency: 20.0
+    costmap_update_timeout: 2.0
     odom_topic: "/odom/localization_odom"
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
