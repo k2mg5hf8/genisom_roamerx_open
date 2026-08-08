@@ -59,3 +59,18 @@ localization:
     init_quat_change_threshold: 0.01      
     global_localization_timeout: 10.0     
 
+    # GNSS recovery
+    use_gnss_recovery: true
+    gnss_topic: "/gnss/fix"
+    gnss_max_age: 1.0
+
+    gnss_anchor_valid: true
+
+    gnss_anchor_lat: 55.665704642697
+    gnss_anchor_lon: 37.477746134800
+
+    gnss_anchor_map_x: -1.559438414875
+    gnss_anchor_map_y: 1.624594266671
+
+    # ENU -> map, -165.401780°
+    gnss_map_yaw: -2.886805653986

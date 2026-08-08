@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
 
 #include <rclcpp/rclcpp.hpp>
 #include <pcl_ros/transforms.hpp>
@@ -19,6 +20,8 @@
 
 #include <std_srvs/srv/empty.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/nav_sat_status.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -77,6 +80,17 @@ public:
     std::string status_topic            = declare_parameter<std::string>("status_topic", "/status");
     std::string localization_info_topic = declare_parameter<std::string>("localization_info_topic", "/localization_info");
     std::string global_map_points_topic = declare_parameter<std::string>("global_map_points_topic", "/global_map_points");
+    std::string gnss_topic              = declare_parameter<std::string>("gnss_topic", "/gps/fix");
+
+    // GNSS is used only as a recovery seed. NDT must still confirm the final pose.
+    use_gnss_recovery_ = declare_parameter<bool>("use_gnss_recovery", true);
+    gnss_anchor_valid_ = declare_parameter<bool>("gnss_anchor_valid", false);
+    gnss_max_age_ = declare_parameter<double>("gnss_max_age", 1.0);
+    gnss_anchor_lat_ = declare_parameter<double>("gnss_anchor_lat", 0.0);
+    gnss_anchor_lon_ = declare_parameter<double>("gnss_anchor_lon", 0.0);
+    gnss_anchor_map_x_ = declare_parameter<double>("gnss_anchor_map_x", 0.0);
+    gnss_anchor_map_y_ = declare_parameter<double>("gnss_anchor_map_y", 0.0);
+    gnss_map_yaw_ = declare_parameter<double>("gnss_map_yaw", 0.0);
 
     // Load numeric parameters
     imu_data_filter_num_      = declare_parameter<int>("imu_data_filter_num", 5);
@@ -208,6 +222,10 @@ public:
     points_sub      = create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, 2, std::bind(&HdlLocalizationNode::points_callback, this, std::placeholders::_1));
     initialpose_sub =
       create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 8, std::bind(&HdlLocalizationNode::initialpose_callback, this, std::placeholders::_1));
+    gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+      gnss_topic,
+      rclcpp::SensorDataQoS(),
+      std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));
 
     localization_lidar_info_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(100), // 10Hz 
@@ -373,6 +391,53 @@ private:
     }
   }
 
+  void gnss_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
+    if (!use_gnss_recovery_ || !gnss_anchor_valid_) {
+      return;
+    }
+
+    if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX ||
+        !std::isfinite(msg->latitude) || !std::isfinite(msg->longitude)) {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      gnss_valid_ = false;
+      return;
+    }
+
+    constexpr double earth_radius_m = 6378137.0;
+    constexpr double deg_to_rad = 3.14159265358979323846 / 180.0;
+
+    const double anchor_lat_rad = gnss_anchor_lat_ * deg_to_rad;
+    const double east =
+      (msg->longitude - gnss_anchor_lon_) * deg_to_rad * earth_radius_m * std::cos(anchor_lat_rad);
+    const double north =
+      (msg->latitude - gnss_anchor_lat_) * deg_to_rad * earth_radius_m;
+
+    // Rotate local ENU coordinates into the LiDAR map frame.
+    const double cos_yaw = std::cos(gnss_map_yaw_);
+    const double sin_yaw = std::sin(gnss_map_yaw_);
+    const double map_x = gnss_anchor_map_x_ + cos_yaw * east - sin_yaw * north;
+    const double map_y = gnss_anchor_map_y_ + sin_yaw * east + cos_yaw * north;
+
+    rclcpp::Time measurement_time(msg->header.stamp, get_clock()->get_clock_type());
+    if (measurement_time.nanoseconds() == 0) {
+      measurement_time = get_clock()->now();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      latest_gnss_ = *msg;
+      last_gnss_time_ = measurement_time;
+      gnss_map_x_ = map_x;
+      gnss_map_y_ = map_y;
+      gnss_valid_ = true;
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "GNSS: lat=%.8f lon=%.8f -> map=[%.3f, %.3f]",
+      msg->latitude, msg->longitude, map_x, map_y);
+  }
+
   void make_recovery(){
 
     RCLCPP_WARN(get_logger(), "Recovery: return to the last reliable pose");
@@ -384,6 +449,31 @@ private:
     Eigen::Vector3f    new_pos  = last_reliable_pose_.block<3, 1>(0, 3);
     new_pos(2) = 0;
     Eigen::Quaternionf new_quat(last_reliable_pose_.block<3, 3>(0, 0));
+
+    // Keep the last reliable pose as the fallback. GNSS only changes the
+    // initial hypothesis passed to NDT; it is never accepted without a scan match.
+    Eigen::Vector3f recovery_seed = new_pos;
+    bool using_gnss_seed = false;
+    if (use_gnss_recovery_) {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      if (gnss_valid_ && last_gnss_time_.nanoseconds() != 0) {
+        const double gnss_age = (get_clock()->now() - last_gnss_time_).seconds();
+        if (gnss_age >= 0.0 && gnss_age <= gnss_max_age_) {
+          recovery_seed.x() = static_cast<float>(gnss_map_x_);
+          recovery_seed.y() = static_cast<float>(gnss_map_y_);
+          using_gnss_seed = true;
+          RCLCPP_WARN(
+            get_logger(),
+            "Recovery: using GNSS seed [%.3f, %.3f], age %.2f s",
+            recovery_seed.x(), recovery_seed.y(), gnss_age);
+        } else {
+          RCLCPP_WARN(
+            get_logger(),
+            "Recovery: GNSS measurement is stale (age %.2f s, limit %.2f s)",
+            gnss_age, gnss_max_age_);
+        }
+      }
+    }
 
     // Try a candidate sweep around the last reliable pose - but only if we're
     // past the cooldown since the last sweep. During cooldown, just snap back
@@ -402,6 +492,10 @@ private:
       // and NDT has a wider convergence basin than point-to-point ICP.
       last_recovery_search_time_ = get_clock()->now();
       Eigen::Matrix4d initial_trans = last_reliable_pose_.cast<double>();
+      if (using_gnss_seed) {
+        initial_trans(0, 3) = recovery_seed.x();
+        initial_trans(1, 3) = recovery_seed.y();
+      }
       std::vector<Eigen::Matrix4d> candidates = global_localization_ptr_->generateCandidates(initial_trans);
 
       bool found = false;
@@ -1594,6 +1688,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr                 points_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr                 globalmap_sub;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr                   gnss_sub_;
   rclcpp::TimerBase::SharedPtr localization_lidar_info_timer_;
   rclcpp::TimerBase::SharedPtr odom_publish_timer_; 
 
@@ -1609,6 +1704,22 @@ private:
   // imu input buffer
   mutable std::mutex imu_data_mutex;
   std::vector<sensor_msgs::msg::Imu::ConstSharedPtr> imu_data;
+
+  // GNSS recovery input and map alignment parameters.
+  mutable std::mutex gnss_mutex_;
+  sensor_msgs::msg::NavSatFix latest_gnss_;
+  rclcpp::Time last_gnss_time_{0, 0, RCL_ROS_TIME};
+  bool gnss_valid_ = false;
+  bool use_gnss_recovery_ = true;
+  bool gnss_anchor_valid_ = false;
+  double gnss_max_age_ = 1.0;
+  double gnss_anchor_lat_ = 0.0;
+  double gnss_anchor_lon_ = 0.0;
+  double gnss_anchor_map_x_ = 0.0;
+  double gnss_anchor_map_y_ = 0.0;
+  double gnss_map_yaw_ = 0.0;
+  double gnss_map_x_ = 0.0;
+  double gnss_map_y_ = 0.0;
   
   // transformation matrices 
   Eigen::Matrix3f init_rotation_matrix_ = Eigen::Matrix3f::Identity();
