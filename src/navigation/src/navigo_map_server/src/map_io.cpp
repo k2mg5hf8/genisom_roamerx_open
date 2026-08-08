@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -106,6 +107,17 @@ static char* dirname(char* path)
 namespace navigo_map_server
 {
     using navigo_util::geometry_utils::orientationAroundZAxis;
+
+    namespace
+    {
+        std::once_flag graphics_magick_init_once;
+        std::mutex     graphics_magick_io_mutex;
+
+        void initializeGraphicsMagick()
+        {
+            std::call_once(graphics_magick_init_once, []() { Magick::InitializeMagick(nullptr); });
+        }
+    }  // namespace
 
     // === Map input part ===
 
@@ -216,7 +228,11 @@ namespace navigo_map_server
 
     void loadMapFromFile(const LoadParameters& load_parameters, nav_msgs::msg::OccupancyGrid& map)
     {
-        Magick::InitializeMagick(nullptr);
+        initializeGraphicsMagick();
+        // GraphicsMagick keeps process-global state and an image pixel-cache.
+        // Keep map I/O out of concurrent component callbacks and avoid mixing
+        // its cache with a second layer of OpenMP workers.
+        std::lock_guard<std::mutex> graphics_magick_lock(graphics_magick_io_mutex);
 
         nav_msgs::msg::OccupancyGrid msg;
 
@@ -256,13 +272,10 @@ namespace navigo_map_server
         // --- 6) grab raw buffer ---
         MagickLib::PixelPacket* pixels = img.getPixels(0, 0, width, height);
 
-        // --- 7) fill in parallel per-mode ---
+        // --- 7) fill per-mode ---
         switch (load_parameters.mode)
         {
             case MapMode::Trinary:
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
                 for (size_t y = 0; y < height; ++y)
                 {
                     MagickLib::PixelPacket* row  = pixels + y * width;
@@ -284,9 +297,6 @@ namespace navigo_map_server
                 break;
 
             case MapMode::Scale:
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
                 for (size_t y = 0; y < height; ++y)
                 {
                     MagickLib::PixelPacket* row  = pixels + y * width;
@@ -321,9 +331,6 @@ namespace navigo_map_server
                 break;
 
             case MapMode::Raw:
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
                 for (size_t y = 0; y < height; ++y)
                 {
                     MagickLib::PixelPacket* row  = pixels + y * width;
@@ -400,9 +407,6 @@ namespace navigo_map_server
      */
     void checkSaveParameters(SaveParameters& save_parameters)
     {
-        // Magick must me initialized before any activity with images
-        Magick::InitializeMagick(nullptr);
-
         // Checking map file name
         if (save_parameters.map_file_name == "")
         {
@@ -629,6 +633,9 @@ namespace navigo_map_server
 
     bool saveMapToFile(const nav_msgs::msg::OccupancyGrid& map, const SaveParameters& save_parameters)
     {
+        initializeGraphicsMagick();
+        std::lock_guard<std::mutex> graphics_magick_lock(graphics_magick_io_mutex);
+
         // Local copy of SaveParameters that might be modified by checkSaveParameters()
         SaveParameters save_parameters_loc = save_parameters;
 

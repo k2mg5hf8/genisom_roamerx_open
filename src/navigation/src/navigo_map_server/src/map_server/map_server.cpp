@@ -105,11 +105,14 @@ namespace navigo_map_server
         // Make name prefix for services
         const std::string service_prefix = get_name() + std::string("/");
 
-        map_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        // Map load/get operate on the same large OccupancyGrid and must not
+        // execute concurrently in the multi-threaded component container.
+        map_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
         // Create a service that provides the occupancy grid
         occ_service_ = create_service<nav_msgs::srv::GetMap>(
-            service_prefix + std::string(service_name_), std::bind(&MapServer::getMapCallback, this, _1, _2, _3));
+            service_prefix + std::string(service_name_), std::bind(&MapServer::getMapCallback, this, _1, _2, _3),
+            rmw_qos_profile_services_default, map_callback_group_);
 
         // Create a publisher using the QoS settings to emulate a ROS1 latched topic
         occ_pub_ =
