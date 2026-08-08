@@ -21,15 +21,18 @@ std::vector<Eigen::Matrix4d> GlobalLocalization::generateCandidates(const Eigen:
     Eigen::Vector3d init_pos = initial_pose.block<3,1>(0,3);
     Eigen::Matrix3d init_rot = initial_pose.block<3, 3>(0, 0);
     Eigen::Matrix2d init_rot_2d = initial_pose.block<2, 2>(0, 0);
-    std::vector<double> deltas_x = {0.0, 0.3};
-    std::vector<double> deltas_y = {0.0};
-    std::vector<double> deltas_w = {-25.0,  0.0,  25}; // degrees
+    // Ordered from the most likely local seed to wider forward/backward and
+    // lateral hypotheses. Recovery gates in the caller still bound every pose.
+    const std::vector<Eigen::Vector2d> offsets = {
+        {0.0, 0.0}, {0.3, 0.0}, {-0.3, 0.0}, {0.0, 0.3}, {0.0, -0.3},
+        {0.6, 0.0}, {-0.6, 0.0}, {0.0, 0.6}, {0.0, -0.6}};
+    const std::vector<double> deltas_w = {0.0, -25.0, 25.0, -45.0, 45.0};
     std::vector<Eigen::Matrix4d> candidates;
-    for (const auto& dx : deltas_x){
-        for (const auto& dy : deltas_y){
-             for (const auto& dw : deltas_w){
+    candidates.reserve(offsets.size() * deltas_w.size());
+    for (const auto& offset : offsets){
+        for (const auto& dw : deltas_w){
                 Eigen::Matrix4d candidate = Eigen::Matrix4d::Identity();
-                Eigen::Vector2d offset_xy = init_rot_2d * Eigen::Vector2d(dx, dy);
+                Eigen::Vector2d offset_xy = init_rot_2d * offset;
                 candidate.block<3, 1>(0, 3) = init_pos + Eigen::Vector3d(offset_xy.x(), offset_xy.y(), 0.0);
                 Eigen::Matrix3d rot_yaw_delta;
                 double d_rad = dw * M_PI / 180.0;
@@ -38,7 +41,6 @@ std::vector<Eigen::Matrix4d> GlobalLocalization::generateCandidates(const Eigen:
                 Eigen::Matrix3d new_rot = rot_yaw_delta * init_rot;
                 candidate.block<3, 3>(0, 0) = new_rot;
                 candidates.push_back(candidate);
-             }
         }
     }
     return candidates;    

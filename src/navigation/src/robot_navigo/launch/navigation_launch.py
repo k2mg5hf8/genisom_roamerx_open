@@ -44,7 +44,11 @@ def generate_launch_description():
     # intercepts it at subscription time regardless of where the string came from.
     # On a robot whose driver natively publishes under a different name (e.g.
     # /livox/lidar), pass lidar_topic:=... instead of running a topic_tools relay.
-    remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static'), ('/front_lidar', lidar_topic)]
+    remappings = [
+        ('/tf', '/mo_tf'),
+        ('/tf_static', '/mo_tf_static'),
+        ('/front_lidar', lidar_topic),
+    ]
 
     # Create our own temporary YAML files that include substitutions
     param_substitutions = {
@@ -145,7 +149,7 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=remappings
+                remappings=remappings + [('cmd_vel', 'cmd_vel_nav')]
             ),
             Node(
                 package='navigo_path_planner',
@@ -174,7 +178,7 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=remappings
+                remappings=remappings + [('cmd_vel', 'cmd_vel_nav')]
             ),
             Node(
                 package='navigo_velocity_optimizer',
@@ -185,7 +189,11 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=remappings
+                remappings=remappings + [
+                    ('cmd_vel', 'cmd_vel_nav'),
+                    ('/cmd_vel', '/cmd_vel_autonomy'),
+                    ('cmd_vel_smoothed', '/cmd_vel_autonomy'),
+                ]
             ),
             Node(
                 package='navigo_bt_navigator',
@@ -278,7 +286,11 @@ def generate_launch_description():
                         plugin='navigo_velocity_optimizer::VelocityOptimizer',
                         name='velocity_optimizer',
                         parameters=[configured_params],
-                        remappings=remappings + [('cmd_vel', 'cmd_vel_nav'),  ('cmd_vel_smoothed', 'cmd_vel')]
+                        remappings=remappings + [
+                            ('cmd_vel', 'cmd_vel_nav'),
+                            ('/cmd_vel', '/cmd_vel_autonomy'),
+                            ('cmd_vel_smoothed', '/cmd_vel_autonomy'),
+                        ]
                     ),
                     ComposableNode(
                         package='navigo_bt_navigator',

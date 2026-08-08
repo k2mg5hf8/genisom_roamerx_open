@@ -23,6 +23,23 @@ def generate_launch_description():
     return LaunchDescription([
         lidar_topic_arg,
         imu_topic_arg,
+        Node(
+            package='localization',
+            executable='pointcloud_self_filter_node',
+            name='pointcloud_self_filter',
+            output='screen',
+            parameters=[
+                config_file,
+                {'input_topic': LaunchConfiguration('lidar_topic')},
+            ],
+        ),
+        Node(
+            package='localization',
+            executable='motor_odom_deduplicator_node',
+            name='motor_odom_deduplicator',
+            output='screen',
+            parameters=[config_file],
+        ),
         # 启动定位节点
         Node(
             package='localization',
@@ -33,6 +50,10 @@ def generate_launch_description():
             remappings=[
                 ('/front_lidar', LaunchConfiguration('lidar_topic')),
                 ('/front_lidar/imu', LaunchConfiguration('imu_topic')),
+                # Isolate the MO dynamic TF authority from the closed
+                # /robot_tf selector that continues publishing on /tf.
+                ('/tf', '/mo_tf'),
+                ('/tf_static', '/mo_tf_static'),
             ]
         ),
 
@@ -49,6 +70,11 @@ def generate_launch_description():
             name='lidar_tf',
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments=['0.0', '0.0', '0.0', '0', '0', '0', '1', 'base_link', 'livox_frame']
+            arguments=[
+                '--x', '0.0', '--y', '0.0', '--z', '0.0',
+                '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
+                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame',
+            ],
+            remappings=[('/tf_static', '/mo_tf_static')],
         )
-    ]) 
+    ])

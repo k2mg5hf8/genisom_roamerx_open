@@ -34,7 +34,7 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     lidar_topic = LaunchConfiguration('lidar_topic')
 
-    remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+    remappings = [('/tf', '/mo_tf'), ('/tf_static', '/mo_tf_static')]
 
     params_file = ReplaceString(
         source_file=params_file,

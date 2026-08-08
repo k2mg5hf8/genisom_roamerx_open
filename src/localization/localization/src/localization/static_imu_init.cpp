@@ -73,15 +73,19 @@ namespace localization
             return false;
         }
 
-        // if ( acce_cov_.norm () >  max_static_acce_var_) {
-        //         std::cout << "加速度计测量噪声太大  --> " <<  acce_cov_.norm () << " > " <<  max_static_acce_var_ << std::endl;
-        //         return false;
-        // }
+        if (acce_cov_.norm() > max_static_acce_var_)
+        {
+            std::cout << "Accelerometer variance is too high for static initialization: "
+                      << acce_cov_.norm() << " > " << max_static_acce_var_ << std::endl;
+            return false;
+        }
 
         init_bias_gyro_ = mean_gyro_;
         init_bias_acce_ = mean_acce_;
         init_success_   = true;
-        std::cout << "IMU Init Sucessful !!!!!!" << std::endl;
+        std::cout << "IMU static initialization succeeded: gyro_bias="
+                  << init_bias_gyro_.transpose() << " mean_acc="
+                  << init_bias_acce_.transpose() << std::endl;
         return true;
     }
 

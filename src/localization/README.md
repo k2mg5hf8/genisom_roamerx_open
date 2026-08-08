@@ -1,4 +1,12 @@
 # Localization
+
+> **MO implementation note:** the description below is the original vendor
+> documentation and no longer fully describes this fork. The active MO pipeline
+> uses motor twist + IMU as a deterministic predictor, planar NDT as map
+> correction, `enable_internal_odom_ukf: false`, `/localization_info_health` as
+> the canonical status, and isolated `/mo_tf*` topics. See
+> [../../MO_LOCALIZATION_ARCHITECTURE_RU.md](../../MO_LOCALIZATION_ARCHITECTURE_RU.md)
+> for the current architecture and build instructions.
 ---
 ## 描述（Description）
 A multi-sensor fusion localization package based on ROS2 Humble, subscribed to receive PCD point cloud maps, fused IMU and Lidar, using UKF filtering method for localization, and outputting localization information, including position information, direction information, velocity information.

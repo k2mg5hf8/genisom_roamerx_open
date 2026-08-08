@@ -12,7 +12,6 @@ find_package(rclcpp REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
-find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -62,7 +61,6 @@ ament_target_dependencies(${PROJECT_NAME}_lib
   tf2_ros
   tf2_geometry_msgs
   tf2_eigen
-  pcl_ros
   pcl_conversions
   sensor_msgs
   geometry_msgs
@@ -86,13 +84,27 @@ add_executable(${PROJECT_NAME}_node
   src/localization/static_imu_init.cpp
   src/localization/global_localization.cpp
 )
+
+add_executable(pointcloud_self_filter_node
+  apps/pointcloud_self_filter.cpp
+)
+add_executable(motor_odom_deduplicator_node
+  apps/motor_odom_deduplicator.cpp
+)
+ament_target_dependencies(pointcloud_self_filter_node
+  rclcpp
+  sensor_msgs
+)
+ament_target_dependencies(motor_odom_deduplicator_node
+  rclcpp
+  nav_msgs
+)
 ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
   std_srvs
   tf2_ros
   tf2_geometry_msgs
   tf2_eigen
-  pcl_ros
   pcl_conversions
   sensor_msgs
   geometry_msgs
@@ -121,6 +133,8 @@ install(
 install(
   TARGETS
     ${PROJECT_NAME}_node
+    pointcloud_self_filter_node
+    motor_odom_deduplicator_node
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 

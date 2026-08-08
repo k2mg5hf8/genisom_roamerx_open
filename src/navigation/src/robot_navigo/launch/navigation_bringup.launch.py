@@ -340,8 +340,15 @@ def generate_launch_description():
     # ld.add_action(custom_odom_baselink_node)
     # ld.add_action(odom_tf_publisher_node)
     # ld.add_action(cmd_cel_lcm_publisher_node)
-    ld.add_action(load_vel_cmd_pub_node)
-    ld.add_action(mode_status_pub_node)
+    # Do not launch the vendor /cmd_vel -> LCM/UDP command path here.  The
+    # maintained application stack routes Nav2 through
+    # /cmd_vel_autonomy -> control_manager -> the selected bridge.  Keeping a
+    # second bridge dormant behind legacy /cmd_vel would become a safety bypass
+    # as soon as any old publisher appeared on that topic.  The executables are
+    # still built and can be started explicitly for supervised vendor debug.
+    ld.add_action(LogInfo(
+        msg='Legacy robot_navigo command bridge disabled; control_manager owns locomotion'
+    ))
 
     # Add the actions to launch all of the navigation nodes
     ld.add_action(bringup_cmd)
