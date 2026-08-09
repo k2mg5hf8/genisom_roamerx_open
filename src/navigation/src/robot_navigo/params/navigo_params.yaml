@@ -209,9 +209,13 @@ controller_server:
 
     # Progress checker parameters
     progress_checker:
-      plugin: "navigo_path_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # Consider both translation and rotation. The former vendor code loaded
+      # this plugin but never called it, allowing an active goal to remain
+      # motionless until the application-level mission timeout.
+      plugin: "navigo_path_controller::PoseProgressChecker"
+      required_movement_radius: 0.2
+      required_movement_angle: 0.25
+      movement_time_allowance: 15.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "navigo_path_controller::SimpleGoalChecker"
