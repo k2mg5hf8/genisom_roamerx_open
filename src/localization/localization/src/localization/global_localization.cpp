@@ -4,6 +4,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <Eigen/Dense>
+#include <algorithm>
 
 namespace localization {
 
@@ -17,7 +18,8 @@ void GlobalLocalization::init(const Eigen::Matrix4d& initial_pose) {
 }
 
 
-std::vector<Eigen::Matrix4d> GlobalLocalization::generateCandidates(const Eigen::Matrix4d& initial_pose){
+std::vector<Eigen::Matrix4d> GlobalLocalization::generateCandidates(
+    const Eigen::Matrix4d& initial_pose, double translation_scale){
     Eigen::Vector3d init_pos = initial_pose.block<3,1>(0,3);
     Eigen::Matrix3d init_rot = initial_pose.block<3, 3>(0, 0);
     Eigen::Matrix2d init_rot_2d = initial_pose.block<2, 2>(0, 0);
@@ -32,7 +34,8 @@ std::vector<Eigen::Matrix4d> GlobalLocalization::generateCandidates(const Eigen:
     for (const auto& offset : offsets){
         for (const auto& dw : deltas_w){
                 Eigen::Matrix4d candidate = Eigen::Matrix4d::Identity();
-                Eigen::Vector2d offset_xy = init_rot_2d * offset;
+                Eigen::Vector2d offset_xy =
+                    init_rot_2d * (std::max(0.0, translation_scale) * offset);
                 candidate.block<3, 1>(0, 3) = init_pos + Eigen::Vector3d(offset_xy.x(), offset_xy.y(), 0.0);
                 Eigen::Matrix3d rot_yaw_delta;
                 double d_rad = dw * M_PI / 180.0;

@@ -63,6 +63,7 @@ ament_target_dependencies(${PROJECT_NAME}_lib
   tf2_eigen
   pcl_conversions
   sensor_msgs
+  std_msgs
   geometry_msgs
   nav_msgs
   ndt_omp
@@ -107,6 +108,7 @@ ament_target_dependencies(${PROJECT_NAME}_node
   tf2_eigen
   pcl_conversions
   sensor_msgs
+  std_msgs
   geometry_msgs
   nav_msgs
   ndt_omp

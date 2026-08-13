@@ -23,7 +23,9 @@ namespace localization {
                 const Eigen::Matrix4d& initial_trans,  
                 Eigen::Matrix4d& final_pose
             );
-            std::vector<Eigen::Matrix4d> generateCandidates(const Eigen::Matrix4d& initial_pose);
+            std::vector<Eigen::Matrix4d> generateCandidates(
+                const Eigen::Matrix4d& initial_pose,
+                double translation_scale = 1.0);
 
             bool recoveryLocalization(
                 const pcl::PointCloud<pcl::PointXYZI>::Ptr& global_map,

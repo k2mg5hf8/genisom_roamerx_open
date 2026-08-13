@@ -11,6 +11,8 @@ def generate_launch_description():
     # 获取配置文件路径
     localization_dir = get_package_share_directory('localization')
     config_file = os.path.join(localization_dir, 'config', 'config.yaml')
+    gnss_recovery_disabled_file = os.path.join(
+        localization_dir, 'config', 'gnss_recovery_disabled.yaml')
 
     # Per-robot sensor topic names. Defaults match config.yaml's points_topic/imu_topic,
     # so on the "native" robot nothing changes. On a robot with different native topic
@@ -19,10 +21,19 @@ def generate_launch_description():
     # subscription time, no extra process, no duplicated sensor traffic.
     lidar_topic_arg = DeclareLaunchArgument('lidar_topic', default_value='/front_lidar')
     imu_topic_arg = DeclareLaunchArgument('imu_topic', default_value='/front_lidar/imu')
+    gnss_recovery_config_arg = DeclareLaunchArgument(
+        'gnss_recovery_config',
+        default_value=gnss_recovery_disabled_file,
+        description=(
+            'Optional site-specific GNSS recovery parameter file. The default '
+            'keeps GNSS recovery completely disabled.'
+        ),
+    )
 
     return LaunchDescription([
         lidar_topic_arg,
         imu_topic_arg,
+        gnss_recovery_config_arg,
         Node(
             package='localization',
             executable='pointcloud_self_filter_node',
@@ -46,7 +57,7 @@ def generate_launch_description():
             executable='localization_node',
             name='localization',
             output='screen',
-            parameters=[config_file],
+            parameters=[config_file, LaunchConfiguration('gnss_recovery_config')],
             remappings=[
                 ('/front_lidar', LaunchConfiguration('lidar_topic')),
                 ('/front_lidar/imu', LaunchConfiguration('imu_topic')),

@@ -1,0 +1,36 @@
+localization:
+  ros__parameters:
+    # Safe default. GNSS is not subscribed and cannot affect localization.
+    use_gnss_recovery: false
+
+    # Topic interface provided by security_robot_gnss when enabled.
+    gnss_topic: /gnss/fix
+    gnss_ready_topic: /gnss/ready
+    gnss_require_ready: true
+
+    # A site-specific map <-> ENU binding is mandatory before enabling.
+    gnss_anchor_valid: false
+    gnss_anchor_lat: 0.0
+    gnss_anchor_lon: 0.0
+    gnss_anchor_map_x: 0.0
+    gnss_anchor_map_y: 0.0
+    gnss_map_yaw: 0.0
+
+    # base_link -> GNSS antenna lever arm, metres. These safe defaults must be
+    # replaced by measured values in the per-robot/site override.
+    gnss_antenna_x: 0.0
+    gnss_antenna_y: 0.0
+
+    # Input qualification. These checks precede NDT and do not replace its
+    # map gates or consecutive-scan verification.
+    gnss_max_fix_age_sec: 1.0
+    gnss_max_ready_age_sec: 2.0
+    gnss_max_horizontal_std_m: 4.0
+    gnss_min_samples: 8
+    gnss_sample_window_sec: 3.0
+    gnss_max_sample_spread_m: 1.5
+    gnss_max_seed_xy_error: 2.5
+    gnss_max_seed_yaw_error_deg: 50.0
+    # Reuses the same 45 NDT hypotheses as odometry, but expands the ±0.6 m
+    # translation offsets to ±1.8 m without multiplying CPU cost.
+    gnss_candidate_translation_scale: 3.0

@@ -23,7 +23,10 @@
 
 #include <std_srvs/srv/empty.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/nav_sat_status.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -91,6 +94,39 @@ public:
     publish_vendor_localization_info_ =
       declare_parameter<bool>("publish_vendor_localization_info", false);
     std::string global_map_points_topic = declare_parameter<std::string>("global_map_points_topic", "/global_map_points");
+
+    // GNSS never updates either localization filter directly. It is an
+    // optional fallback seed for the existing NDT recovery search and every
+    // resulting pose must still pass map gates and multi-scan verification.
+    use_gnss_recovery_ = declare_parameter<bool>("use_gnss_recovery", false);
+    std::string gnss_topic = declare_parameter<std::string>("gnss_topic", "/gnss/fix");
+    std::string gnss_ready_topic =
+      declare_parameter<std::string>("gnss_ready_topic", "/gnss/ready");
+    gnss_require_ready_ = declare_parameter<bool>("gnss_require_ready", true);
+    gnss_anchor_valid_ = declare_parameter<bool>("gnss_anchor_valid", false);
+    gnss_max_fix_age_sec_ = declare_parameter<double>("gnss_max_fix_age_sec", 1.0);
+    gnss_max_ready_age_sec_ = declare_parameter<double>("gnss_max_ready_age_sec", 2.0);
+    gnss_max_horizontal_std_m_ =
+      declare_parameter<double>("gnss_max_horizontal_std_m", 4.0);
+    gnss_min_samples_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("gnss_min_samples", 8)));
+    gnss_sample_window_sec_ = declare_parameter<double>("gnss_sample_window_sec", 3.0);
+    gnss_max_sample_spread_m_ =
+      declare_parameter<double>("gnss_max_sample_spread_m", 1.5);
+    gnss_max_seed_xy_error_ = static_cast<float>(
+      declare_parameter<double>("gnss_max_seed_xy_error", 2.5));
+    gnss_max_seed_yaw_error_deg_ = static_cast<float>(
+      declare_parameter<double>("gnss_max_seed_yaw_error_deg", 50.0));
+    gnss_candidate_translation_scale_ = std::clamp(
+      declare_parameter<double>("gnss_candidate_translation_scale", 3.0),
+      1.0, 10.0);
+    gnss_anchor_lat_ = declare_parameter<double>("gnss_anchor_lat", 0.0);
+    gnss_anchor_lon_ = declare_parameter<double>("gnss_anchor_lon", 0.0);
+    gnss_anchor_map_x_ = declare_parameter<double>("gnss_anchor_map_x", 0.0);
+    gnss_anchor_map_y_ = declare_parameter<double>("gnss_anchor_map_y", 0.0);
+    gnss_map_yaw_ = declare_parameter<double>("gnss_map_yaw", 0.0);
+    gnss_antenna_x_ = declare_parameter<double>("gnss_antenna_x", 0.0);
+    gnss_antenna_y_ = declare_parameter<double>("gnss_antenna_y", 0.0);
 
     // Load numeric parameters
     imu_data_filter_num_      = declare_parameter<int>("imu_data_filter_num", 5);
@@ -332,6 +368,20 @@ public:
         map_pose_gate_topic_, map_qos,
         std::bind(&HdlLocalizationNode::occupancy_map_callback, this, std::placeholders::_1));
     }
+    if (use_gnss_recovery_) {
+      gnss_fix_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+        gnss_topic, rclcpp::SensorDataQoS(),
+        std::bind(&HdlLocalizationNode::gnss_callback, this, std::placeholders::_1));
+      gnss_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+        gnss_ready_topic, rclcpp::QoS(rclcpp::KeepLast(5)).reliable(),
+        std::bind(&HdlLocalizationNode::gnss_ready_callback, this, std::placeholders::_1));
+      RCLCPP_WARN(
+        get_logger(),
+        "GNSS recovery seed enabled: fix=%s ready=%s anchor_valid=%s; GNSS cannot update the UKF directly",
+        gnss_topic.c_str(), gnss_ready_topic.c_str(), gnss_anchor_valid_ ? "true" : "false");
+    } else {
+      RCLCPP_INFO(get_logger(), "GNSS recovery seed disabled");
+    }
 
     localization_lidar_info_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(100), // 10Hz 
@@ -454,11 +504,31 @@ private:
   uint64_t deskew_applied_scan_count_ = 0;
   uint64_t deskew_skipped_scan_count_ = 0;
 
+  struct GnssSample {
+    int64_t stamp_ns = 0;
+    double map_x = 0.0;
+    double map_y = 0.0;
+    double horizontal_std_m = std::numeric_limits<double>::infinity();
+  };
+
+  struct GnssRecoverySeed {
+    bool valid = false;
+    Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+    int sample_count = 0;
+    double newest_age_sec = std::numeric_limits<double>::infinity();
+    double horizontal_std_m = std::numeric_limits<double>::infinity();
+    double sample_spread_m = std::numeric_limits<double>::infinity();
+  };
+
   struct RecoveryResult {
     bool found = false;
+    bool from_gnss = false;
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f reference_pose = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f source_odom_pose = Eigen::Matrix4f::Identity();
     int64_t source_stamp_ns = 0;
+    float verification_max_xy = 0.0f;
+    float verification_max_yaw_deg = 0.0f;
     double score = std::numeric_limits<double>::infinity();
     double best_observed_score = std::numeric_limits<double>::infinity();
     float best_observed_xy_error = std::numeric_limits<float>::infinity();
@@ -596,6 +666,9 @@ private:
   bool has_initialization_hold_pose_ = false;
   Eigen::Matrix4f initialization_hold_pose_{Eigen::Matrix4f::Identity()};
   bool recovery_verification_active_ = false;
+  bool recovery_verification_from_gnss_ = false;
+  float recovery_verification_reference_max_xy_ = 0.0f;
+  float recovery_verification_reference_max_yaw_deg_ = 0.0f;
   bool has_recovery_verification_anchor_ = false;
   Eigen::Matrix4f recovery_verification_anchor_map_pose_{Eigen::Matrix4f::Identity()};
   Eigen::Matrix4f recovery_verification_anchor_odom_pose_{Eigen::Matrix4f::Identity()};
@@ -604,6 +677,230 @@ private:
   std::mutex occupancy_map_mutex_;
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr occupancy_map_;
   std::future<RecoveryResult> recovery_future_;
+
+  bool use_gnss_recovery_ = false;
+  bool gnss_require_ready_ = true;
+  bool gnss_anchor_valid_ = false;
+  double gnss_max_fix_age_sec_ = 1.0;
+  double gnss_max_ready_age_sec_ = 2.0;
+  double gnss_max_horizontal_std_m_ = 4.0;
+  int gnss_min_samples_ = 8;
+  double gnss_sample_window_sec_ = 3.0;
+  double gnss_max_sample_spread_m_ = 1.5;
+  float gnss_max_seed_xy_error_ = 2.5f;
+  float gnss_max_seed_yaw_error_deg_ = 50.0f;
+  double gnss_candidate_translation_scale_ = 3.0;
+  double gnss_anchor_lat_ = 0.0;
+  double gnss_anchor_lon_ = 0.0;
+  double gnss_anchor_map_x_ = 0.0;
+  double gnss_anchor_map_y_ = 0.0;
+  double gnss_map_yaw_ = 0.0;
+  double gnss_antenna_x_ = 0.0;
+  double gnss_antenna_y_ = 0.0;
+  std::mutex gnss_mutex_;
+  std::deque<GnssSample> gnss_samples_;
+  bool gnss_ready_ = false;
+  int64_t gnss_ready_receive_ns_ = 0;
+
+  static double median(std::vector<double> values) {
+    if (values.empty()) return std::numeric_limits<double>::quiet_NaN();
+    const size_t middle = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + middle, values.end());
+    const double upper = values[middle];
+    if ((values.size() % 2) != 0) return upper;
+    std::nth_element(values.begin(), values.begin() + middle - 1, values.begin() + middle);
+    return 0.5 * (values[middle - 1] + upper);
+  }
+
+  void gnss_ready_callback(const std_msgs::msg::Bool::ConstSharedPtr msg) {
+    std::lock_guard<std::mutex> lock(gnss_mutex_);
+    gnss_ready_ = msg->data;
+    gnss_ready_receive_ns_ = get_clock()->now().nanoseconds();
+    if (!gnss_ready_) {
+      gnss_samples_.clear();
+    }
+  }
+
+  void gnss_callback(const sensor_msgs::msg::NavSatFix::ConstSharedPtr msg) {
+    if (!use_gnss_recovery_ || !gnss_anchor_valid_) return;
+    if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX ||
+        !std::isfinite(msg->latitude) || !std::isfinite(msg->longitude) ||
+        msg->position_covariance_type ==
+          sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "GNSS recovery input rejected: fix/status/covariance is not usable");
+      return;
+    }
+
+    const double var_x = msg->position_covariance[0];
+    const double cov_xy = 0.5 *
+      (msg->position_covariance[1] + msg->position_covariance[3]);
+    const double var_y = msg->position_covariance[4];
+    if (!std::isfinite(var_x) || !std::isfinite(cov_xy) ||
+        !std::isfinite(var_y) || var_x < 0.0 || var_y < 0.0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "GNSS recovery input rejected: invalid horizontal covariance");
+      return;
+    }
+    const double half_delta = 0.5 * (var_x - var_y);
+    const double max_horizontal_variance =
+      0.5 * (var_x + var_y) +
+      std::sqrt(half_delta * half_delta + cov_xy * cov_xy);
+    const double horizontal_std_m =
+      std::sqrt(std::max(0.0, max_horizontal_variance));
+    if (!std::isfinite(horizontal_std_m) ||
+        horizontal_std_m > gnss_max_horizontal_std_m_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "GNSS recovery input rejected: horizontal std %.2f m exceeds %.2f m",
+        horizontal_std_m, gnss_max_horizontal_std_m_);
+      return;
+    }
+
+    constexpr double kEarthRadiusM = 6378137.0;
+    constexpr double kDegToRad = M_PI / 180.0;
+    const double anchor_lat_rad = gnss_anchor_lat_ * kDegToRad;
+    const double east = (msg->longitude - gnss_anchor_lon_) * kDegToRad *
+      kEarthRadiusM * std::cos(anchor_lat_rad);
+    const double north = (msg->latitude - gnss_anchor_lat_) * kDegToRad *
+      kEarthRadiusM;
+    const double cos_yaw = std::cos(gnss_map_yaw_);
+    const double sin_yaw = std::sin(gnss_map_yaw_);
+
+    GnssSample sample;
+    sample.map_x = gnss_anchor_map_x_ + cos_yaw * east - sin_yaw * north;
+    sample.map_y = gnss_anchor_map_y_ + sin_yaw * east + cos_yaw * north;
+    sample.horizontal_std_m = horizontal_std_m;
+    sample.stamp_ns = rclcpp::Time(
+      msg->header.stamp, get_clock()->get_clock_type()).nanoseconds();
+    if (sample.stamp_ns == 0) sample.stamp_ns = get_clock()->now().nanoseconds();
+
+    {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      if (!gnss_samples_.empty() && sample.stamp_ns <= gnss_samples_.back().stamp_ns) {
+        return;
+      }
+      gnss_samples_.push_back(sample);
+      const int64_t window_ns = static_cast<int64_t>(
+        std::max(0.1, gnss_sample_window_sec_) * 1e9);
+      while (!gnss_samples_.empty() &&
+             sample.stamp_ns - gnss_samples_.front().stamp_ns > window_ns) {
+        gnss_samples_.pop_front();
+      }
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "GNSS recovery input accepted: map antenna=[%.2f, %.2f], horizontal_std=%.2f m",
+      sample.map_x, sample.map_y, sample.horizontal_std_m);
+  }
+
+  GnssRecoverySeed gnss_recovery_seed(
+      const Eigen::Matrix4f& expected_pose,
+      const rclcpp::Time& source_stamp) {
+    GnssRecoverySeed seed;
+    if (!use_gnss_recovery_ || !gnss_anchor_valid_) return seed;
+
+    std::vector<GnssSample> samples;
+    bool ready = false;
+    int64_t ready_receive_ns = 0;
+    {
+      std::lock_guard<std::mutex> lock(gnss_mutex_);
+      samples.assign(gnss_samples_.begin(), gnss_samples_.end());
+      ready = gnss_ready_;
+      ready_receive_ns = gnss_ready_receive_ns_;
+    }
+
+    const int64_t source_ns = source_stamp.nanoseconds();
+    const double ready_age_sec = ready_receive_ns == 0 ?
+      std::numeric_limits<double>::infinity() :
+      static_cast<double>(source_ns - ready_receive_ns) * 1e-9;
+    if (gnss_require_ready_ &&
+        (!ready || ready_age_sec < -0.5 || ready_age_sec > gnss_max_ready_age_sec_)) {
+      RCLCPP_WARN(get_logger(),
+        "GNSS recovery seed unavailable: /gnss/ready is false or stale (age=%.2f s)",
+        ready_age_sec);
+      return seed;
+    }
+    if (samples.empty()) return seed;
+
+    const int64_t window_ns = static_cast<int64_t>(
+      std::max(0.1, gnss_sample_window_sec_) * 1e9);
+    samples.erase(
+      std::remove_if(samples.begin(), samples.end(),
+        [source_ns, window_ns](const GnssSample& sample) {
+          return sample.stamp_ns > source_ns + 500000000LL ||
+                 source_ns - sample.stamp_ns > window_ns;
+        }),
+      samples.end());
+    if (static_cast<int>(samples.size()) < gnss_min_samples_) {
+      RCLCPP_WARN(get_logger(),
+        "GNSS recovery seed unavailable: only %zu/%d recent samples",
+        samples.size(), gnss_min_samples_);
+      return seed;
+    }
+
+    const auto newest = std::max_element(
+      samples.begin(), samples.end(),
+      [](const GnssSample& lhs, const GnssSample& rhs) {
+        return lhs.stamp_ns < rhs.stamp_ns;
+      });
+    seed.newest_age_sec =
+      static_cast<double>(source_ns - newest->stamp_ns) * 1e-9;
+    if (seed.newest_age_sec < -0.5 ||
+        seed.newest_age_sec > gnss_max_fix_age_sec_) {
+      RCLCPP_WARN(get_logger(),
+        "GNSS recovery seed unavailable: newest fix age %.2f s exceeds %.2f s",
+        seed.newest_age_sec, gnss_max_fix_age_sec_);
+      return seed;
+    }
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    xs.reserve(samples.size());
+    ys.reserve(samples.size());
+    seed.horizontal_std_m = 0.0;
+    for (const auto& sample : samples) {
+      xs.push_back(sample.map_x);
+      ys.push_back(sample.map_y);
+      seed.horizontal_std_m =
+        std::max(seed.horizontal_std_m, sample.horizontal_std_m);
+    }
+    const double antenna_x = median(xs);
+    const double antenna_y = median(ys);
+    seed.sample_spread_m = 0.0;
+    for (const auto& sample : samples) {
+      seed.sample_spread_m = std::max(
+        seed.sample_spread_m,
+        std::hypot(sample.map_x - antenna_x, sample.map_y - antenna_y));
+    }
+    if (seed.sample_spread_m > gnss_max_sample_spread_m_) {
+      RCLCPP_WARN(get_logger(),
+        "GNSS recovery seed unavailable: %.2f m sample spread exceeds %.2f m",
+        seed.sample_spread_m, gnss_max_sample_spread_m_);
+      return seed;
+    }
+
+    seed.pose = expected_pose;
+    const double expected_yaw = pose_yaw(expected_pose);
+    const double base_to_antenna_map_x =
+      std::cos(expected_yaw) * gnss_antenna_x_ -
+      std::sin(expected_yaw) * gnss_antenna_y_;
+    const double base_to_antenna_map_y =
+      std::sin(expected_yaw) * gnss_antenna_x_ +
+      std::cos(expected_yaw) * gnss_antenna_y_;
+    seed.pose(0, 3) = static_cast<float>(antenna_x - base_to_antenna_map_x);
+    seed.pose(1, 3) = static_cast<float>(antenna_y - base_to_antenna_map_y);
+    seed.sample_count = static_cast<int>(samples.size());
+    seed.valid = pose_is_map_safe(seed.pose);
+    if (!seed.valid) {
+      RCLCPP_WARN(get_logger(),
+        "GNSS recovery seed rejected by occupancy-map pose gate");
+    }
+    return seed;
+  }
 
   void occupancy_map_callback(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
     std::lock_guard<std::mutex> lock(occupancy_map_mutex_);
@@ -1453,46 +1750,96 @@ private:
       return;
     }
     const int64_t source_stamp_ns = source_stamp.nanoseconds();
+    const GnssRecoverySeed gnss_seed =
+      gnss_recovery_seed(expected_pose, source_stamp);
 
     recovery_future_ = std::async(std::launch::async,
       [this, cloud_copy, map, expected_pose, max_xy, max_yaw, max_score,
-       planar_z, planar_roll, planar_pitch, source_odom_pose, source_stamp_ns]() {
-        RecoveryResult result;
-        result.source_odom_pose = source_odom_pose;
-        result.source_stamp_ns = source_stamp_ns;
+       planar_z, planar_roll, planar_pitch, source_odom_pose, source_stamp_ns,
+       gnss_seed]() {
         auto recovery_registration = create_registration(4);
-        if (!recovery_registration) return result;
+        RecoveryResult unavailable;
+        unavailable.source_odom_pose = source_odom_pose;
+        unavailable.source_stamp_ns = source_stamp_ns;
+        if (!recovery_registration) return unavailable;
         recovery_registration->setInputTarget(map);
         recovery_registration->setInputSource(cloud_copy);
-        const auto candidates = global_localization_ptr_->generateCandidates(expected_pose.cast<double>());
-        for (const auto& candidate : candidates) {
-          pcl::PointCloud<PointT> aligned;
-          recovery_registration->align(aligned, candidate.cast<float>());
-          if (!recovery_registration->hasConverged()) continue;
-          const double score = recovery_registration->getFitnessScore();
-          const Eigen::Matrix4f pose = project_planar_pose(
-            recovery_registration->getFinalTransformation(),
-            planar_z, planar_roll, planar_pitch);
-          const float xy_error =
-            (pose.block<2, 1>(0, 3) - expected_pose.block<2, 1>(0, 3)).norm();
-          const float yaw_error_deg = angle_distance(pose_yaw(pose), pose_yaw(expected_pose)) *
-            180.0f / static_cast<float>(M_PI);
-          if (score < result.best_observed_score) {
-            result.best_observed_score = score;
-            result.best_observed_xy_error = xy_error;
-            result.best_observed_yaw_error_deg = yaw_error_deg;
-          }
-          if (score > max_score || !poses_agree(pose, expected_pose, max_xy, max_yaw) ||
-              !pose_is_map_safe(pose) || !transition_is_map_safe(expected_pose, pose)) continue;
-          if (!result.found || score < result.score) {
-            result.found = true;
-            result.pose = pose;
-            result.score = score;
-          }
+
+        const auto evaluate_seed =
+          [&](const Eigen::Matrix4f& seed_pose, bool from_gnss,
+              float seed_max_xy, float seed_max_yaw_deg,
+              double candidate_translation_scale) {
+            RecoveryResult result;
+            result.from_gnss = from_gnss;
+            result.reference_pose = seed_pose;
+            result.source_odom_pose = source_odom_pose;
+            result.source_stamp_ns = source_stamp_ns;
+            result.verification_max_xy = seed_max_xy;
+            result.verification_max_yaw_deg = seed_max_yaw_deg;
+            const auto candidates =
+              global_localization_ptr_->generateCandidates(
+                seed_pose.cast<double>(), candidate_translation_scale);
+            for (const auto& candidate : candidates) {
+              pcl::PointCloud<PointT> aligned;
+              recovery_registration->align(aligned, candidate.cast<float>());
+              if (!recovery_registration->hasConverged()) continue;
+              const double score = recovery_registration->getFitnessScore();
+              const Eigen::Matrix4f pose = project_planar_pose(
+                recovery_registration->getFinalTransformation(),
+                planar_z, planar_roll, planar_pitch);
+              const float xy_error =
+                (pose.block<2, 1>(0, 3) - seed_pose.block<2, 1>(0, 3)).norm();
+              const float yaw_error_deg = angle_distance(
+                pose_yaw(pose), pose_yaw(seed_pose)) *
+                180.0f / static_cast<float>(M_PI);
+              if (score < result.best_observed_score) {
+                result.best_observed_score = score;
+                result.best_observed_xy_error = xy_error;
+                result.best_observed_yaw_error_deg = yaw_error_deg;
+              }
+              const bool transition_safe = from_gnss ||
+                transition_is_map_safe(seed_pose, pose);
+              if (score > max_score ||
+                  !poses_agree(pose, seed_pose, seed_max_xy, seed_max_yaw_deg) ||
+                  !pose_is_map_safe(pose) || !transition_safe) {
+                continue;
+              }
+              if (!result.found || score < result.score) {
+                result.found = true;
+                result.pose = pose;
+                result.score = score;
+              }
+            }
+            return result;
+          };
+
+        // Preserve stable behavior: the fused-odometry recovery always gets
+        // first refusal. GNSS is evaluated only if no safe local candidate
+        // was found, so a healthy odometry recovery cannot be displaced by a
+        // repeated structure near the GNSS position.
+        RecoveryResult odom_result = evaluate_seed(
+          expected_pose, false, max_xy, max_yaw, 1.0);
+        if (odom_result.found || !gnss_seed.valid) return odom_result;
+
+        RecoveryResult gnss_result = evaluate_seed(
+          gnss_seed.pose, true,
+          gnss_max_seed_xy_error_, gnss_max_seed_yaw_error_deg_,
+          gnss_candidate_translation_scale_);
+        if (gnss_result.found ||
+            gnss_result.best_observed_score < odom_result.best_observed_score) {
+          return gnss_result;
         }
-        return result;
+        return odom_result;
       });
-    RCLCPP_WARN(get_logger(), "Recovery NDT candidate search started in background");
+    if (gnss_seed.valid) {
+      RCLCPP_WARN(get_logger(),
+        "Recovery NDT search started: odometry first, GNSS fallback=[%.2f, %.2f] samples=%d std=%.2f m spread=%.2f m",
+        gnss_seed.pose(0, 3), gnss_seed.pose(1, 3), gnss_seed.sample_count,
+        gnss_seed.horizontal_std_m, gnss_seed.sample_spread_m);
+    } else {
+      RCLCPP_WARN(get_logger(),
+        "Recovery NDT candidate search started with odometry seed only");
+    }
   }
 
   bool consume_recovery_result(const rclcpp::Time& stamp) {
@@ -1508,13 +1855,25 @@ private:
     }
     const Eigen::Matrix4f propagated_pose =
       result.pose * result.source_odom_pose.inverse() * current_odom_pose;
-    float max_xy = recovery_max_odom_xy_error_;
-    float max_yaw_deg = recovery_max_odom_yaw_error_deg_;
-    const bool agrees_with_prediction = result.found &&
-      recovery_pose_agrees_with_prediction(propagated_pose, stamp, &max_xy, &max_yaw_deg);
+    float max_xy = result.verification_max_xy;
+    float max_yaw_deg = result.verification_max_yaw_deg;
+    bool agrees_with_prediction = false;
+    if (result.found && result.from_gnss) {
+      const GnssRecoverySeed fresh_gnss_seed =
+        gnss_recovery_seed(degraded_pose_, stamp);
+      agrees_with_prediction = fresh_gnss_seed.valid &&
+        poses_agree(
+          propagated_pose, fresh_gnss_seed.pose,
+          max_xy, max_yaw_deg) &&
+        pose_is_map_safe(propagated_pose);
+    } else if (result.found) {
+      agrees_with_prediction = recovery_pose_agrees_with_prediction(
+        propagated_pose, stamp, &max_xy, &max_yaw_deg);
+    }
     if (!agrees_with_prediction) {
       RCLCPP_WARN(get_logger(),
-        "Background recovery rejected: best score=%.4f xy_error=%.3f/%.3f m yaw_error=%.1f/%.1f deg",
+        "Background %s recovery rejected: best score=%.4f xy_error=%.3f/%.3f m yaw_error=%.1f/%.1f deg",
+        result.from_gnss ? "GNSS-seeded" : "odometry-seeded",
         result.best_observed_score, result.best_observed_xy_error,
         max_xy, result.best_observed_yaw_error_deg, max_yaw_deg);
       return false;
@@ -1527,9 +1886,13 @@ private:
     is_init_success_ = false;
     init_match_count_ = 0;
     recovery_verification_active_ = true;
+    recovery_verification_from_gnss_ = result.from_gnss;
+    recovery_verification_reference_max_xy_ = max_xy;
+    recovery_verification_reference_max_yaw_deg_ = max_yaw_deg;
     has_recovery_verification_offset_ = false;
     RCLCPP_WARN(get_logger(),
-      "Background recovery candidate accepted for stateless %d-scan verification, score=%.4f limits=%.3f m/%.1f deg",
+      "Background %s recovery candidate accepted for stateless %d-scan verification, score=%.4f limits=%.3f m/%.1f deg",
+      result.from_gnss ? "GNSS-seeded" : "odometry-seeded",
       recovery_verification_count_threshold_, result.score, max_xy, max_yaw_deg);
     return true;
   }
@@ -1605,6 +1968,7 @@ private:
         is_init_success_ = false;
         init_match_count_ = 0;
         recovery_verification_active_ = false;
+        recovery_verification_from_gnss_ = false;
         has_recovery_verification_anchor_ = false;
         has_recovery_verification_offset_ = false;
         localization_state_ = 1;
@@ -1765,24 +2129,42 @@ private:
             "NDT correction rejected before UKF update by occupancy-map pose gate");
           return false;
         }
-        if (has_reliable_pose_ &&
+        if (has_reliable_pose_ && !recovery_verification_from_gnss_ &&
             !odom_trajectory_is_map_safe(candidate_pose, scan_stamp_ns)) {
           candidate_rejection_reason = "occupancy_transition_gate";
           RCLCPP_WARN(get_logger(),
             "NDT correction rejected before UKF update: transition crosses occupied or unknown map space");
           return false;
         }
-        if (degraded_odom_active_ &&
-            !recovery_pose_agrees_with_prediction(
-              candidate_pose, rclcpp::Time(stamp),
-              &recovery_consistency_max_xy, &recovery_consistency_max_yaw_deg)) {
+        bool recovery_reference_agrees = true;
+        Eigen::Matrix4f recovery_reference = degraded_pose_;
+        if (degraded_odom_active_ && recovery_verification_from_gnss_) {
+          recovery_consistency_max_xy = recovery_verification_reference_max_xy_;
+          recovery_consistency_max_yaw_deg =
+            recovery_verification_reference_max_yaw_deg_;
+          recovery_reference_agrees = has_deterministic_initial_guess &&
+            poses_agree(
+              candidate_pose, deterministic_initial_guess,
+              recovery_consistency_max_xy,
+              recovery_consistency_max_yaw_deg);
+          if (has_deterministic_initial_guess) {
+            recovery_reference = deterministic_initial_guess;
+          }
+        } else if (degraded_odom_active_) {
+          recovery_reference_agrees = recovery_pose_agrees_with_prediction(
+            candidate_pose, rclcpp::Time(stamp),
+            &recovery_consistency_max_xy, &recovery_consistency_max_yaw_deg);
+        }
+        if (degraded_odom_active_ && !recovery_reference_agrees) {
           const float consistency_xy =
-            (candidate_pose.block<2, 1>(0, 3) - degraded_pose_.block<2, 1>(0, 3)).norm();
+            (candidate_pose.block<2, 1>(0, 3) -
+             recovery_reference.block<2, 1>(0, 3)).norm();
           const float consistency_yaw_deg = angle_distance(
-            pose_yaw(candidate_pose), pose_yaw(degraded_pose_)) *
+            pose_yaw(candidate_pose), pose_yaw(recovery_reference)) *
             180.0f / static_cast<float>(M_PI);
           RCLCPP_WARN(get_logger(),
-            "NDT correction rejected before UKF update by fused-prediction consistency gate: score=%.4f xy=%.3f/%.3f m yaw=%.1f/%.1f deg",
+            "NDT correction rejected before UKF update by %s consistency gate: score=%.4f xy=%.3f/%.3f m yaw=%.1f/%.1f deg",
+            recovery_verification_from_gnss_ ? "GNSS-seeded" : "fused-prediction",
             score, consistency_xy, recovery_consistency_max_xy,
             consistency_yaw_deg, recovery_consistency_max_yaw_deg);
           candidate_rejection_reason = "recovery_prediction_gate";
@@ -1883,6 +2265,7 @@ private:
               match_result.fitness_score_, cur_pos.x(), cur_pos.y(), cur_pos.z(), angle);
             init_match_count_ = 0;
             recovery_verification_active_ = false;
+            recovery_verification_from_gnss_ = false;
             has_recovery_verification_anchor_ = false;
             has_recovery_verification_offset_ = false;
           }
@@ -1890,6 +2273,7 @@ private:
           const bool aborted_recovery_candidate = recovery_verification_active_;
           init_match_count_ = 0;
           recovery_verification_active_ = false;
+          recovery_verification_from_gnss_ = false;
           has_recovery_verification_anchor_ = false;
           has_recovery_verification_offset_ = false;
           if (aborted_recovery_candidate) {
@@ -2042,6 +2426,7 @@ private:
     degraded_odom_blocked_ = false;
     degraded_odom_stationary_episode_ = false;
     recovery_verification_active_ = false;
+    recovery_verification_from_gnss_ = false;
     has_recovery_verification_anchor_ = false;
     has_recovery_verification_offset_ = false;
     has_reliable_odom_pose_ = false;
@@ -3143,6 +3528,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr                 globalmap_sub;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr occupancy_map_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gnss_fix_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr gnss_ready_sub_;
   rclcpp::TimerBase::SharedPtr localization_lidar_info_timer_;
   rclcpp::TimerBase::SharedPtr odom_publish_timer_;
   rclcpp::TimerBase::SharedPtr local_odom_publish_timer_;
