@@ -18,7 +18,7 @@
 /odom/mc_odom
   -> motor_odom_deduplicator
   -> /odom/mc_odom_unique
-  -> localization predictor: linear twist only
+  -> localization predictor: linear twist + causal pose-increment reconciliation
 
 /front_lidar/imu
   -> localization predictor: gyro yaw rate + IMU data
@@ -26,6 +26,7 @@
 map.pcd -> /load_map_service -> localization
 /map -------------------------> map pose gate
 /initialpose -----------------> initialization/relocalization
+/gnss/fix --------------------> optional recovery seed only
 ```
 
 Выход:
@@ -57,8 +58,12 @@ lidar_tf -> /mo_tf_static
 Текущая схема не использует абсолютную motor-odom pose как глобальную позу:
 
 - translation интегрируется из motor `twist`;
+- последовательные приращения motor pose устраняют пропущенный путь только
+  после пауз timestamp длиннее twist timeout; в штатном потоке predictor
+  остаётся twist-driven, произвольный origin не используется;
 - yaw интегрируется из IMU gyro;
-- motor yaw после начальной привязки не обновляет ориентацию;
+- motor yaw плавно отслеживает преобразование fixed-осей vendor odom в fused frame,
+  но не заменяет IMU-ориентацию;
 - `enable_internal_odom_ukf: false`, второй odometry UKF отключен;
 - NDT корректирует предсказанную позу относительно PCD map;
 - deskew выключен;
@@ -68,15 +73,20 @@ lidar_tf -> /mo_tf_static
 
 | Параметр | Значение |
 |---|---:|
-| Main NDT threads | 6 |
-| Recovery NDT threads | 4 |
+| Main NDT threads | 4 |
+| Recovery NDT threads | 2 |
 | ROS MultiThreadedExecutor | 3 |
 | NDT resolution | 0.5 m |
 | Input voxel | 0.30 m |
 | Main NDT max rate | 4 Hz |
 | Fused odom publish rate | 50 Hz |
 
-Основная NDT-коррекция проверяется по fitness, максимальному скачку `x/y/yaw`, согласованности с fused predictor и occupancy map. Recovery принимается после 6 последовательных согласованных кандидатов. При неподвижном роботе recovery ограничен `0.20 m` и `5 deg`.
+Основная NDT-коррекция проверяется по fitness, максимальному скачку `x/y/yaw`,
+согласованности с fused predictor и occupancy map. Фоновый recovery сначала
+ищет позу около causal fused-odom seed, затем проверяет её на 6 последовательных
+NDT-сканах без изменения рабочего фильтра. GNSS, если включён отдельным site
+config, используется только как запасной seed после неудачи odom-поиска. При
+неподвижном роботе recovery ограничен `0.20 m` и `5 deg`.
 
 ## 4. Статусы
 
@@ -118,6 +128,7 @@ Launch-файлы `robot_navigo` remap-ят `/tf` в `/mo_tf`, а `/tf_static` �
 | `/odom/mc_odom_unique` | `nav_msgs/msg/Odometry` |
 | `/map` | `nav_msgs/msg/OccupancyGrid` |
 | `/initialpose` | `geometry_msgs/msg/PoseWithCovarianceStamped` |
+| `/gnss/fix` | `sensor_msgs/msg/NavSatFix` (только при `use_gnss_recovery: true`) |
 | `/load_map_service` | `robots_dog_msgs/srv/LoadMap` |
 
 ### Выходы
@@ -162,7 +173,7 @@ ros2 pkg executables localization
 
 ## 8. Известные риски
 
-1. `/odom/mc_odom` имеет два известных publisher (`ecal2ros2`, `dog_task`). Deduplicator проверяет timestamp, но не фиксирует конкретный publisher.
+1. `/odom/mc_odom` имеет два известных publisher (`ecal2ros2`, `dog_task`). Deduplicator проверяет timestamp, но не фиксирует конкретный publisher. В полевых bag встречались 2–3-секундные серии повторов одного timestamp; predictor удерживает скорость лишь 0.35 s и затем причинно догоняет измеренное приращение после прихода свежего timestamp.
 2. LiDAR timestamps запаздывают относительно ROS now; costmap может отбрасывать облака как более старые, чем TF cache.
 3. В слабой геометрии и на краю карты NDT может потерять однозначный минимум.
 4. Main/recovery NDT, Nav2 и Zenoh конкурируют за CPU; Foxglove усиливает нагрузку подписками на облака и TF.

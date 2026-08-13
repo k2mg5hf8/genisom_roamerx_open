@@ -172,6 +172,14 @@ public:
       declare_parameter<double>("motor_twist_stale_timeout_sec", 0.35);
     motor_twist_filter_alpha_ = static_cast<float>(
       declare_parameter<double>("motor_twist_filter_alpha", 0.25));
+    motor_pose_reconciliation_enabled_ =
+      declare_parameter<bool>("motor_pose_reconciliation_enabled", true);
+    motor_pose_reconciliation_max_speed_ = static_cast<float>(
+      declare_parameter<double>("motor_pose_reconciliation_max_speed", 1.5));
+    motor_pose_reconciliation_margin_ = static_cast<float>(
+      declare_parameter<double>("motor_pose_reconciliation_margin", 0.25));
+    motor_pose_reconciliation_max_correction_ = static_cast<float>(
+      declare_parameter<double>("motor_pose_reconciliation_max_correction", 2.0));
     motor_odom_alignment_tracking_enabled_ =
       declare_parameter<bool>("motor_odom_alignment_tracking_enabled", true);
     motor_odom_alignment_filter_alpha_ = static_cast<float>(
@@ -377,6 +385,12 @@ public:
         motor_odom_alignment_tracking_enabled_ ? "true" : "false",
         motor_odom_alignment_filter_alpha_, motor_odom_alignment_yaw_offset_deg_);
       RCLCPP_INFO(
+        get_logger(),
+        "Motor pose reconciliation: enabled=%s max_speed=%.2f m/s margin=%.2f m max_correction=%.2f m",
+        motor_pose_reconciliation_enabled_ ? "true" : "false",
+        motor_pose_reconciliation_max_speed_, motor_pose_reconciliation_margin_,
+        motor_pose_reconciliation_max_correction_);
+      RCLCPP_INFO(
         get_logger(), "Internal odometry UKF is %s; deterministic fused prediction remains active",
         enable_internal_odom_ukf_ ? "enabled" : "disabled");
       RCLCPP_INFO(
@@ -493,6 +507,10 @@ private:
   double localization_scan_min_interval_sec_ = 0.18;
   double motor_twist_stale_timeout_sec_ = 0.35;
   float motor_twist_filter_alpha_ = 0.25f;
+  bool motor_pose_reconciliation_enabled_ = true;
+  float motor_pose_reconciliation_max_speed_ = 1.5f;
+  float motor_pose_reconciliation_margin_ = 0.25f;
+  float motor_pose_reconciliation_max_correction_ = 2.0f;
   bool motor_odom_alignment_tracking_enabled_ = true;
   float motor_odom_alignment_filter_alpha_ = 0.10f;
   float motor_odom_alignment_yaw_offset_deg_ = 0.0f;
@@ -691,6 +709,11 @@ private:
   uint64_t motor_odom_received_count_ = 0;
   uint64_t motor_odom_duplicate_count_ = 0;
   uint64_t motor_odom_out_of_order_count_ = 0;
+  bool has_last_motor_pose_ = false;
+  int64_t last_motor_pose_stamp_ns_ = 0;
+  float last_motor_pose_x_ = 0.0f;
+  float last_motor_pose_y_ = 0.0f;
+  uint64_t motor_pose_reconciliation_count_ = 0;
   float latest_motor_vx_ = 0.0f;
   float latest_motor_vy_ = 0.0f;
   bool has_motor_twist_ = false;
@@ -1216,10 +1239,11 @@ private:
     return std::atan2(std::sin(yaw), std::cos(yaw));
   }
 
-  bool fused_yaw_at_locked(int64_t stamp_ns, float& yaw) const {
+  bool fused_state_at_locked(
+      int64_t stamp_ns, FusedPredictionState& state) const {
     if (fused_prediction_history_.empty()) return false;
     if (stamp_ns <= fused_prediction_history_.front().stamp_ns) {
-      yaw = fused_prediction_history_.front().yaw;
+      state = fused_prediction_history_.front();
       return true;
     }
     for (size_t index = 1; index < fused_prediction_history_.size(); ++index) {
@@ -1229,12 +1253,117 @@ private:
       const double span = static_cast<double>(after.stamp_ns - before.stamp_ns);
       const float alpha = span > 0.0 ? static_cast<float>(
         static_cast<double>(stamp_ns - before.stamp_ns) / span) : 0.0f;
+      state.x = before.x + alpha * (after.x - before.x);
+      state.y = before.y + alpha * (after.y - before.y);
       const float delta = normalized_yaw(after.yaw - before.yaw);
-      yaw = normalized_yaw(before.yaw + alpha * delta);
+      state.yaw = normalized_yaw(before.yaw + alpha * delta);
+      state.stamp_ns = stamp_ns;
       return true;
     }
-    yaw = fused_prediction_history_.back().yaw;
+    state = fused_prediction_history_.back();
     return true;
+  }
+
+  bool fused_yaw_at_locked(int64_t stamp_ns, float& yaw) const {
+    FusedPredictionState state;
+    if (!fused_state_at_locked(stamp_ns, state)) return false;
+    yaw = state.yaw;
+    return true;
+  }
+
+  void reconcile_motor_pose_locked(
+      int64_t stamp_ns, float motor_x, float motor_y) {
+    if (!motor_pose_reconciliation_enabled_ ||
+        !std::isfinite(motor_x) || !std::isfinite(motor_y)) {
+      has_last_motor_pose_ = false;
+      return;
+    }
+    if (!has_last_motor_pose_) {
+      has_last_motor_pose_ = true;
+      last_motor_pose_stamp_ns_ = stamp_ns;
+      last_motor_pose_x_ = motor_x;
+      last_motor_pose_y_ = motor_y;
+      return;
+    }
+
+    const double dt = static_cast<double>(stamp_ns - last_motor_pose_stamp_ns_) * 1e-9;
+    const float vendor_dx = motor_x - last_motor_pose_x_;
+    const float vendor_dy = motor_y - last_motor_pose_y_;
+    const float measured_distance = std::hypot(vendor_dx, vendor_dy);
+    const float plausible_distance = motor_pose_reconciliation_margin_ +
+      motor_pose_reconciliation_max_speed_ * static_cast<float>(std::max(0.0, dt));
+
+    FusedPredictionState previous_state;
+    FusedPredictionState current_state;
+    const bool history_available = dt > 0.0 &&
+      fused_state_at_locked(last_motor_pose_stamp_ns_, previous_state) &&
+      fused_state_at_locked(stamp_ns, current_state);
+
+    last_motor_pose_stamp_ns_ = stamp_ns;
+    last_motor_pose_x_ = motor_x;
+    last_motor_pose_y_ = motor_y;
+
+    // Normal high-rate samples remain twist-driven to preserve the established
+    // smooth predictor. Pose increments are only a gap-repair mechanism once
+    // the twist necessarily became stale during this source interval.
+    if (dt <= motor_twist_stale_timeout_sec_) return;
+
+    if (!history_available || measured_distance > plausible_distance) {
+      if (measured_distance > plausible_distance) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Motor pose reconciliation rejected implausible step: dt=%.3f s xy=%.3f/%.3f m",
+          dt, measured_distance, plausible_distance);
+      }
+      return;
+    }
+
+    // The vendor pose has an arbitrary origin but its increments are reliable
+    // and use the same fixed/world axes as its twist. Reconcile only the
+    // increment, rotated with the current motor-to-fused basis. This recovers
+    // distance hidden by multi-second repeated source timestamps without ever
+    // using a future sample for an earlier LiDAR scan.
+    const float basis_cos = std::cos(motor_odom_to_fused_yaw_);
+    const float basis_sin = std::sin(motor_odom_to_fused_yaw_);
+    const float measured_dx = basis_cos * vendor_dx - basis_sin * vendor_dy;
+    const float measured_dy = basis_sin * vendor_dx + basis_cos * vendor_dy;
+    const float predicted_dx = current_state.x - previous_state.x;
+    const float predicted_dy = current_state.y - previous_state.y;
+    const float correction_x = measured_dx - predicted_dx;
+    const float correction_y = measured_dy - predicted_dy;
+    const float correction = std::hypot(correction_x, correction_y);
+    if (correction > motor_pose_reconciliation_max_correction_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Motor pose reconciliation rejected excessive correction: dt=%.3f s correction=%.3f/%.3f m",
+        dt, correction, motor_pose_reconciliation_max_correction_);
+      return;
+    }
+    if (correction < 1e-4f) return;
+
+    bool shifted_history = false;
+    for (auto& state : fused_prediction_history_) {
+      if (state.stamp_ns >= stamp_ns) {
+        state.x += correction_x;
+        state.y += correction_y;
+        shifted_history = true;
+      }
+    }
+    // The newest IMU sample can precede this motor sample by a few
+    // milliseconds. Apply the correction to the live state in that case too;
+    // the next IMU history entry will carry it forward causally.
+    fused_prediction_state_.x += correction_x;
+    fused_prediction_state_.y += correction_y;
+    if (!shifted_history && !fused_prediction_history_.empty()) {
+      fused_prediction_history_.back().x += correction_x;
+      fused_prediction_history_.back().y += correction_y;
+    }
+    ++motor_pose_reconciliation_count_;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Motor pose reconciled fused translation: dt=%.3f s correction=%.3f m total=%llu",
+      dt, correction,
+      static_cast<unsigned long long>(motor_pose_reconciliation_count_));
   }
 
   bool motor_twist_at_locked(int64_t stamp_ns, float& vx, float& vy,
@@ -1326,6 +1455,11 @@ private:
         motor_odom_to_fused_yaw_ + alignment_alpha * normalized_yaw(
           target_alignment - motor_odom_to_fused_yaw_));
     }
+
+    reconcile_motor_pose_locked(
+      stamp_ns,
+      static_cast<float>(msg->pose.pose.position.x),
+      static_cast<float>(msg->pose.pose.position.y));
 
     // The vendor linear twist is expressed in its fixed odom/world axes.
     // Rotate it into the IMU-driven fused frame before integrating local deltas.
@@ -1784,7 +1918,15 @@ private:
                                          recovery_max_odom_yaw_error_deg_;
     if (max_xy) *max_xy = xy_limit;
     if (max_yaw_deg) *max_yaw_deg = yaw_limit;
-    return poses_agree(pose, degraded_pose_, xy_limit, yaw_limit);
+    // degraded_pose_ is intentionally frozen once its public fallback motion
+    // budget is exhausted. That safety freeze must not also freeze the hidden
+    // NDT recovery reference: a later causal motor-pose correction can restore
+    // the distance missed during repeated vendor timestamps. The correction is
+    // still provisional and must pass the map gates plus multi-scan NDT
+    // verification before localization status can return to 3.
+    Eigen::Matrix4f expected_pose = degraded_pose_;
+    deterministic_fused_initial_guess(stamp, expected_pose);
+    return poses_agree(pose, expected_pose, xy_limit, yaw_limit);
   }
 
   void enter_degraded_odom(const rclcpp::Time& stamp) {
@@ -2032,6 +2174,7 @@ private:
     recovery_verification_reference_max_xy_ = max_xy;
     recovery_verification_reference_max_yaw_deg_ = max_yaw_deg;
     has_recovery_verification_offset_ = false;
+    set_recovery_verification_correction_limits();
     RCLCPP_WARN(get_logger(),
       "Background %s recovery candidate accepted for stateless %d-scan verification, score=%.4f limits=%.3f m/%.1f deg",
       result.from_gnss ? "GNSS-seeded" : "odometry-seeded",
@@ -2422,6 +2565,10 @@ private:
           if (aborted_recovery_candidate) {
             is_init_success_ = true;
             last_recovery_completion_time_ = get_clock()->now();
+            pose_estimator->set_correction_limits(
+              tracking_max_xy_jump_,
+              tracking_max_yaw_jump_deg_ * static_cast<float>(M_PI) / 180.0f,
+              reliable_threshold_);
             RCLCPP_WARN(get_logger(),
               "Stateless recovery verification failed; candidate discarded without changing UKF or map->odom");
           }
