@@ -104,14 +104,15 @@ localization:
     # supplies yaw rate. The motor pose origin is ignored, but its yaw keeps
     # the vendor fixed/world velocity axes aligned after robot turns.
     # Unique vendor stamps normally arrive at about 16 Hz, but field bags show
-    # occasional 2-3 s repeated-stamp gaps. Twist is held only briefly; when a
-    # fresh stamp returns after a gap longer than the twist timeout, the vendor
-    # pose increment causally reconciles the distance that was hidden during
-    # that gap. Normal high-rate samples remain twist-driven. The arbitrary
-    # pose origin is never treated as a map/global coordinate.
+    # occasional 2-3 s repeated-stamp gaps. Retrospectively applying the full
+    # vendor-pose increment after such a gap is unsafe: successful NDT scans
+    # may already have absorbed part of that motion, so the increment can be
+    # counted twice and immediately trip the tracking jump gate. Keep that
+    # experimental reconciliation disabled until it is made scan-anchor aware.
+    # Normal prediction remains twist-driven and bounded by the stale timeout.
     motor_twist_stale_timeout_sec: 0.35
     motor_twist_filter_alpha: 0.25
-    motor_pose_reconciliation_enabled: true
+    motor_pose_reconciliation_enabled: false
     motor_pose_reconciliation_max_speed: 1.5
     motor_pose_reconciliation_margin: 0.25
     motor_pose_reconciliation_max_correction: 2.0

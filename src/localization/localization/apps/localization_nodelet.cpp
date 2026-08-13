@@ -173,7 +173,7 @@ public:
     motor_twist_filter_alpha_ = static_cast<float>(
       declare_parameter<double>("motor_twist_filter_alpha", 0.25));
     motor_pose_reconciliation_enabled_ =
-      declare_parameter<bool>("motor_pose_reconciliation_enabled", true);
+      declare_parameter<bool>("motor_pose_reconciliation_enabled", false);
     motor_pose_reconciliation_max_speed_ = static_cast<float>(
       declare_parameter<double>("motor_pose_reconciliation_max_speed", 1.5));
     motor_pose_reconciliation_margin_ = static_cast<float>(
@@ -507,7 +507,7 @@ private:
   double localization_scan_min_interval_sec_ = 0.18;
   double motor_twist_stale_timeout_sec_ = 0.35;
   float motor_twist_filter_alpha_ = 0.25f;
-  bool motor_pose_reconciliation_enabled_ = true;
+  bool motor_pose_reconciliation_enabled_ = false;
   float motor_pose_reconciliation_max_speed_ = 1.5f;
   float motor_pose_reconciliation_margin_ = 0.25f;
   float motor_pose_reconciliation_max_correction_ = 2.0f;
