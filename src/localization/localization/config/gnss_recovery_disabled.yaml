@@ -31,6 +31,9 @@ localization:
     gnss_max_sample_spread_m: 1.5
     gnss_max_seed_xy_error: 2.5
     gnss_max_seed_yaw_error_deg: 50.0
+    # Recovery is entered only after a trusted map pose existed and autonomy
+    # was blocked. Reject implausible GNSS teleports before starting NDT.
+    gnss_max_distance_from_prediction_m: 8.0
     # Reuses the same 45 NDT hypotheses as odometry, but expands the ±0.6 m
     # translation offsets to ±1.8 m without multiplying CPU cost.
     gnss_candidate_translation_scale: 3.0

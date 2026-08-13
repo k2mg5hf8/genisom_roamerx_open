@@ -117,6 +117,8 @@ public:
       declare_parameter<double>("gnss_max_seed_xy_error", 2.5));
     gnss_max_seed_yaw_error_deg_ = static_cast<float>(
       declare_parameter<double>("gnss_max_seed_yaw_error_deg", 50.0));
+    gnss_max_distance_from_prediction_m_ = static_cast<float>(
+      declare_parameter<double>("gnss_max_distance_from_prediction_m", 8.0));
     gnss_candidate_translation_scale_ = std::clamp(
       declare_parameter<double>("gnss_candidate_translation_scale", 3.0),
       1.0, 10.0);
@@ -170,6 +172,12 @@ public:
       declare_parameter<double>("motor_twist_stale_timeout_sec", 0.35);
     motor_twist_filter_alpha_ = static_cast<float>(
       declare_parameter<double>("motor_twist_filter_alpha", 0.25));
+    motor_odom_alignment_tracking_enabled_ =
+      declare_parameter<bool>("motor_odom_alignment_tracking_enabled", true);
+    motor_odom_alignment_filter_alpha_ = static_cast<float>(
+      declare_parameter<double>("motor_odom_alignment_filter_alpha", 0.10));
+    motor_odom_alignment_yaw_offset_deg_ = static_cast<float>(
+      declare_parameter<double>("motor_odom_alignment_yaw_offset_deg", 0.0));
     local_odom_publish_rate_hz_ = std::max(
       1.0, declare_parameter<double>("local_odom_publish_rate_hz", 50.0));
     tracking_min_position_stddev_ = declare_parameter<double>(
@@ -192,6 +200,16 @@ public:
       declare_parameter<double>("fused_prediction_max_yaw_step_deg", 12.0));
     degraded_odom_timeout_sec_ = declare_parameter<double>("degraded_odom_timeout_sec", 3.0);
     recovery_search_cooldown_sec_ = declare_parameter<double>("recovery_search_cooldown_sec", 3.0);
+    recovery_retry_backoff_max_sec_ =
+      declare_parameter<double>("recovery_retry_backoff_max_sec", 30.0);
+    recovery_max_attempts_per_episode_ = std::max(
+      1, static_cast<int>(
+        declare_parameter<int>("recovery_max_attempts_per_episode", 6)));
+    main_ndt_num_threads_ = std::max(
+      1, static_cast<int>(declare_parameter<int>("main_ndt_num_threads", 4)));
+    recovery_ndt_num_threads_ = std::max(
+      1, static_cast<int>(
+        declare_parameter<int>("recovery_ndt_num_threads", 2)));
     recovery_max_odom_xy_error_ = static_cast<float>(
       declare_parameter<double>("recovery_max_odom_xy_error", 1.0));
     recovery_max_odom_yaw_error_deg_ = static_cast<float>(
@@ -354,8 +372,19 @@ public:
         "Fused predictor enabled: translation from %s twist, yaw from IMU gyro",
         motor_odom_topic.c_str());
       RCLCPP_INFO(
+        get_logger(),
+        "Motor odom alignment: tracking=%s alpha=%.3f manual_offset=%.2f deg; twist lookup is causal",
+        motor_odom_alignment_tracking_enabled_ ? "true" : "false",
+        motor_odom_alignment_filter_alpha_, motor_odom_alignment_yaw_offset_deg_);
+      RCLCPP_INFO(
         get_logger(), "Internal odometry UKF is %s; deterministic fused prediction remains active",
         enable_internal_odom_ukf_ ? "enabled" : "disabled");
+      RCLCPP_INFO(
+        get_logger(),
+        "NDT thread budget: tracking=%d recovery=%d; recovery attempts=%d backoff=%.1f..%.1f s",
+        main_ndt_num_threads_, recovery_ndt_num_threads_,
+        recovery_max_attempts_per_episode_, recovery_search_cooldown_sec_,
+        recovery_retry_backoff_max_sec_);
     }
 
     auto points_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
@@ -464,6 +493,9 @@ private:
   double localization_scan_min_interval_sec_ = 0.18;
   double motor_twist_stale_timeout_sec_ = 0.35;
   float motor_twist_filter_alpha_ = 0.25f;
+  bool motor_odom_alignment_tracking_enabled_ = true;
+  float motor_odom_alignment_filter_alpha_ = 0.10f;
+  float motor_odom_alignment_yaw_offset_deg_ = 0.0f;
   float fused_prediction_translation_margin_ = 0.05f;
   float fused_prediction_max_speed_ = 0.75f;
   float fused_prediction_max_yaw_step_deg_ = 12.0f;
@@ -474,7 +506,13 @@ private:
   int bad_match_count_ = 0;
   int recovery_count_multiplier_ = 1;
   rclcpp::Time last_recovery_search_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_recovery_completion_time_{0, 0, RCL_ROS_TIME};
   double recovery_search_cooldown_sec_ = 3.0;
+  double recovery_retry_backoff_max_sec_ = 30.0;
+  int recovery_max_attempts_per_episode_ = 6;
+  int recovery_attempts_in_episode_ = 0;
+  int main_ndt_num_threads_ = 4;
+  int recovery_ndt_num_threads_ = 2;
   double degraded_odom_timeout_sec_ = 3.0;
   float recovery_max_odom_xy_error_ = 1.0f;
   float recovery_max_odom_yaw_error_deg_ = 20.0f;
@@ -540,6 +578,12 @@ private:
     float x = 0.0f;
     float y = 0.0f;
     float yaw = 0.0f;
+  };
+
+  struct MotorTwistSample {
+    int64_t stamp_ns = 0;
+    float vx = 0.0f;
+    float vy = 0.0f;
   };
 
   struct LocalizationOutput {
@@ -637,6 +681,7 @@ private:
 
   std::mutex fused_prediction_mutex_;
   std::deque<FusedPredictionState> fused_prediction_history_;
+  std::deque<MotorTwistSample> motor_twist_history_;
   FusedPredictionState fused_prediction_state_;
   std::mutex map_to_odom_mutex_;
   Eigen::Matrix4f latest_map_to_odom_{Eigen::Matrix4f::Identity()};
@@ -689,6 +734,7 @@ private:
   double gnss_max_sample_spread_m_ = 1.5;
   float gnss_max_seed_xy_error_ = 2.5f;
   float gnss_max_seed_yaw_error_deg_ = 50.0f;
+  float gnss_max_distance_from_prediction_m_ = 8.0f;
   double gnss_candidate_translation_scale_ = 3.0;
   double gnss_anchor_lat_ = 0.0;
   double gnss_anchor_lon_ = 0.0;
@@ -894,6 +940,16 @@ private:
     seed.pose(0, 3) = static_cast<float>(antenna_x - base_to_antenna_map_x);
     seed.pose(1, 3) = static_cast<float>(antenna_y - base_to_antenna_map_y);
     seed.sample_count = static_cast<int>(samples.size());
+    const float distance_from_prediction =
+      (seed.pose.block<2, 1>(0, 3) -
+       expected_pose.block<2, 1>(0, 3)).norm();
+    if (distance_from_prediction > gnss_max_distance_from_prediction_m_) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "GNSS recovery seed rejected: %.2f m from degraded odometry exceeds %.2f m safety bound",
+        distance_from_prediction, gnss_max_distance_from_prediction_m_);
+      return seed;
+    }
     seed.valid = pose_is_map_safe(seed.pose);
     if (!seed.valid) {
       RCLCPP_WARN(get_logger(),
@@ -1055,7 +1111,7 @@ private:
 
   void initialize_params() {
     voxel_filter_ptr_->setLeafSize(points_voxel_filter_size_, points_voxel_filter_size_, points_voxel_filter_size_);
-    registration = create_registration(6);
+    registration = create_registration(main_ndt_num_threads_);
 
     // Initialize global localization
     if (use_global_localization_init_) {
@@ -1156,6 +1212,51 @@ private:
     apply_static_imu_biases_to_estimator();
   }
 
+  static float normalized_yaw(float yaw) {
+    return std::atan2(std::sin(yaw), std::cos(yaw));
+  }
+
+  bool fused_yaw_at_locked(int64_t stamp_ns, float& yaw) const {
+    if (fused_prediction_history_.empty()) return false;
+    if (stamp_ns <= fused_prediction_history_.front().stamp_ns) {
+      yaw = fused_prediction_history_.front().yaw;
+      return true;
+    }
+    for (size_t index = 1; index < fused_prediction_history_.size(); ++index) {
+      const auto& after = fused_prediction_history_[index];
+      if (stamp_ns > after.stamp_ns) continue;
+      const auto& before = fused_prediction_history_[index - 1];
+      const double span = static_cast<double>(after.stamp_ns - before.stamp_ns);
+      const float alpha = span > 0.0 ? static_cast<float>(
+        static_cast<double>(stamp_ns - before.stamp_ns) / span) : 0.0f;
+      const float delta = normalized_yaw(after.yaw - before.yaw);
+      yaw = normalized_yaw(before.yaw + alpha * delta);
+      return true;
+    }
+    yaw = fused_prediction_history_.back().yaw;
+    return true;
+  }
+
+  bool motor_twist_at_locked(int64_t stamp_ns, float& vx, float& vy,
+                             double* age_sec = nullptr) const {
+    if (motor_twist_history_.empty()) return false;
+    const MotorTwistSample* sample = nullptr;
+    for (auto it = motor_twist_history_.rbegin();
+         it != motor_twist_history_.rend(); ++it) {
+      if (it->stamp_ns <= stamp_ns) {
+        sample = &*it;
+        break;
+      }
+    }
+    if (!sample) return false;
+    const double age = static_cast<double>(stamp_ns - sample->stamp_ns) * 1e-9;
+    if (age_sec) *age_sec = age;
+    if (age < 0.0 || age > motor_twist_stale_timeout_sec_) return false;
+    vx = sample->vx;
+    vy = sample->vy;
+    return true;
+  }
+
   void motor_odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
     const int64_t stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
     std::lock_guard<std::mutex> lock(fused_prediction_mutex_);
@@ -1184,36 +1285,46 @@ private:
         vendor_vx, vendor_vy);
       return;
     }
-    // The vendor pose origin and all subsequent motor yaw samples are ignored.
-    // Its first valid yaw is used once to identify the fixed orientation of
-    // the vendor odom axes. Dynamic yaw remains exclusively IMU-driven.
+    // The vendor position origin is ignored, but its orientation is required
+    // to keep the vendor fixed/world twist axes aligned with the IMU-driven
+    // fused frame after the robot turns. It never replaces fused yaw.
+    const auto& q = msg->pose.pose.orientation;
+    const double norm_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (!std::isfinite(norm_sq) || norm_sq < 1e-12) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Waiting for a valid motor odometry orientation; translation prediction held");
+      return;
+    }
+    const double inv_norm = 1.0 / std::sqrt(norm_sq);
+    const double qx = q.x * inv_norm;
+    const double qy = q.y * inv_norm;
+    const double qz = q.z * inv_norm;
+    const double qw = q.w * inv_norm;
+    const float motor_yaw = static_cast<float>(std::atan2(
+      2.0 * (qw * qz + qx * qy),
+      1.0 - 2.0 * (qy * qy + qz * qz)));
+    float fused_yaw = fused_prediction_state_.yaw;
+    fused_yaw_at_locked(stamp_ns, fused_yaw);
+    const float manual_offset = motor_odom_alignment_yaw_offset_deg_ *
+      static_cast<float>(M_PI) / 180.0f;
+    const float target_alignment = normalized_yaw(
+      fused_yaw - motor_yaw + manual_offset);
     if (!has_motor_odom_frame_alignment_) {
-      const auto& q = msg->pose.pose.orientation;
-      const double norm_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-      if (!std::isfinite(norm_sq) || norm_sq < 1e-12) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 1000,
-          "Waiting for a valid initial motor odometry orientation; translation prediction held");
-        return;
-      }
-      const double inv_norm = 1.0 / std::sqrt(norm_sq);
-      const double x = q.x * inv_norm;
-      const double y = q.y * inv_norm;
-      const double z = q.z * inv_norm;
-      const double w = q.w * inv_norm;
-      const float motor_yaw = static_cast<float>(std::atan2(
-        2.0 * (w * z + x * y),
-        1.0 - 2.0 * (y * y + z * z)));
-      motor_odom_to_fused_yaw_ = std::atan2(
-        std::sin(fused_prediction_state_.yaw - motor_yaw),
-        std::cos(fused_prediction_state_.yaw - motor_yaw));
+      motor_odom_to_fused_yaw_ = target_alignment;
       has_motor_odom_frame_alignment_ = true;
       RCLCPP_INFO(
         get_logger(),
-        "Motor odom frame aligned once: motor_yaw=%.2f deg fused_yaw=%.2f deg offset=%.2f deg; future motor yaw ignored",
+        "Motor odom frame aligned: motor_yaw=%.2f deg fused_yaw=%.2f deg offset=%.2f deg",
         motor_yaw * 180.0f / static_cast<float>(M_PI),
-        fused_prediction_state_.yaw * 180.0f / static_cast<float>(M_PI),
+        fused_yaw * 180.0f / static_cast<float>(M_PI),
         motor_odom_to_fused_yaw_ * 180.0f / static_cast<float>(M_PI));
+    } else if (motor_odom_alignment_tracking_enabled_) {
+      const float alignment_alpha = std::clamp(
+        motor_odom_alignment_filter_alpha_, 0.0f, 1.0f);
+      motor_odom_to_fused_yaw_ = normalized_yaw(
+        motor_odom_to_fused_yaw_ + alignment_alpha * normalized_yaw(
+          target_alignment - motor_odom_to_fused_yaw_));
     }
 
     // The vendor linear twist is expressed in its fixed odom/world axes.
@@ -1232,6 +1343,13 @@ private:
       latest_motor_vx_ += alpha * (raw_vx - latest_motor_vx_);
       latest_motor_vy_ += alpha * (raw_vy - latest_motor_vy_);
     }
+    motor_twist_history_.push_back(
+      MotorTwistSample{stamp_ns, latest_motor_vx_, latest_motor_vy_});
+    const int64_t oldest_allowed_ns = stamp_ns - static_cast<int64_t>(5e9);
+    while (motor_twist_history_.size() > 2 &&
+           motor_twist_history_[1].stamp_ns < oldest_allowed_ns) {
+      motor_twist_history_.pop_front();
+    }
   }
 
   void update_fused_prediction(const rclcpp::Time& stamp, float imu_yaw_rate) {
@@ -1249,12 +1367,13 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
         "Fused predictor IMU gap is %.3f s; translation held for this interval", dt);
     }
-    const bool motor_twist_fresh = latest_motor_twist_stamp_ns_ != 0 &&
-      std::abs(static_cast<double>(stamp_ns - latest_motor_twist_stamp_ns_) * 1e-9) <=
-        motor_twist_stale_timeout_sec_;
     const float integration_dt = static_cast<float>(std::min(dt, 0.05));
-    const float vx = motor_twist_fresh ? std::clamp(latest_motor_vx_, -1.5f, 1.5f) : 0.0f;
-    const float vy = motor_twist_fresh ? std::clamp(latest_motor_vy_, -0.5f, 0.5f) : 0.0f;
+    float sampled_vx = 0.0f;
+    float sampled_vy = 0.0f;
+    const bool motor_twist_fresh = motor_twist_at_locked(
+      stamp_ns, sampled_vx, sampled_vy);
+    const float vx = motor_twist_fresh ? std::clamp(sampled_vx, -1.5f, 1.5f) : 0.0f;
+    const float vy = motor_twist_fresh ? std::clamp(sampled_vy, -0.5f, 0.5f) : 0.0f;
     if (!std::isfinite(imu_yaw_rate)) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -1635,11 +1754,12 @@ private:
     bool motor_twist_fresh = false;
     {
       std::lock_guard<std::mutex> lock(fused_prediction_mutex_);
-      motor_twist_fresh = latest_motor_twist_stamp_ns_ != 0 &&
-        std::abs(static_cast<double>(stamp.nanoseconds() - latest_motor_twist_stamp_ns_) * 1e-9) <=
-          motor_twist_stale_timeout_sec_;
+      float velocity_x = 0.0f;
+      float velocity_y = 0.0f;
+      motor_twist_fresh = motor_twist_at_locked(
+        stamp.nanoseconds(), velocity_x, velocity_y);
       if (motor_twist_fresh) {
-        linear_speed = std::hypot(latest_motor_vx_, latest_motor_vy_);
+        linear_speed = std::hypot(velocity_x, velocity_y);
       }
     }
 
@@ -1670,6 +1790,8 @@ private:
   void enter_degraded_odom(const rclcpp::Time& stamp) {
     if (degraded_odom_active_ || !has_reliable_pose_) return;
     degraded_odom_active_ = true;
+    recovery_attempts_in_episode_ = 0;
+    last_recovery_completion_time_ = rclcpp::Time(0, 0, stamp.get_clock_type());
     degraded_odom_blocked_ = false;
     degraded_odom_stationary_episode_ = robot_is_stationary_for_recovery(stamp);
     degraded_odom_start_time_ = stamp;
@@ -1731,7 +1853,22 @@ private:
     // A ready result must be consumed by the scan callback before another
     // search starts; otherwise a valid recovery could be silently discarded.
     if (recovery_future_.valid()) return;
-    if ((get_clock()->now() - last_recovery_search_time_).seconds() < recovery_search_cooldown_sec_) return;
+    if (recovery_attempts_in_episode_ >= recovery_max_attempts_per_episode_) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "Recovery search budget exhausted after %d attempts; localization remains safely degraded",
+        recovery_attempts_in_episode_);
+      return;
+    }
+    if (last_recovery_completion_time_.nanoseconds() != 0) {
+      const int completed_attempts = std::max(1, recovery_attempts_in_episode_);
+      const double retry_delay = std::min(
+        recovery_retry_backoff_max_sec_,
+        recovery_search_cooldown_sec_ * std::pow(2.0, completed_attempts - 1));
+      if ((get_clock()->now() - last_recovery_completion_time_).seconds() < retry_delay) {
+        return;
+      }
+    }
 
     last_recovery_search_time_ = get_clock()->now();
     auto cloud_copy = pcl::PointCloud<PointT>::Ptr(new pcl::PointCloud<PointT>(*cloud));
@@ -1752,12 +1889,14 @@ private:
     const int64_t source_stamp_ns = source_stamp.nanoseconds();
     const GnssRecoverySeed gnss_seed =
       gnss_recovery_seed(expected_pose, source_stamp);
+    ++recovery_attempts_in_episode_;
+    const int recovery_attempt = recovery_attempts_in_episode_;
 
     recovery_future_ = std::async(std::launch::async,
       [this, cloud_copy, map, expected_pose, max_xy, max_yaw, max_score,
        planar_z, planar_roll, planar_pitch, source_odom_pose, source_stamp_ns,
        gnss_seed]() {
-        auto recovery_registration = create_registration(4);
+        auto recovery_registration = create_registration(recovery_ndt_num_threads_);
         RecoveryResult unavailable;
         unavailable.source_odom_pose = source_odom_pose;
         unavailable.source_stamp_ns = source_stamp_ns;
@@ -1833,12 +1972,14 @@ private:
       });
     if (gnss_seed.valid) {
       RCLCPP_WARN(get_logger(),
-        "Recovery NDT search started: odometry first, GNSS fallback=[%.2f, %.2f] samples=%d std=%.2f m spread=%.2f m",
+        "Recovery NDT search %d/%d started: odometry first, GNSS fallback=[%.2f, %.2f] samples=%d std=%.2f m spread=%.2f m",
+        recovery_attempt, recovery_max_attempts_per_episode_,
         gnss_seed.pose(0, 3), gnss_seed.pose(1, 3), gnss_seed.sample_count,
         gnss_seed.horizontal_std_m, gnss_seed.sample_spread_m);
     } else {
       RCLCPP_WARN(get_logger(),
-        "Recovery NDT candidate search started with odometry seed only");
+        "Recovery NDT search %d/%d started with odometry seed only",
+        recovery_attempt, recovery_max_attempts_per_episode_);
     }
   }
 
@@ -1846,6 +1987,7 @@ private:
     if (!recovery_future_.valid() ||
         recovery_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
     const RecoveryResult result = recovery_future_.get();
+    last_recovery_completion_time_ = get_clock()->now();
     if (!degraded_odom_active_) return false;
     Eigen::Matrix4f current_odom_pose;
     if (!lookup_odom_pose(stamp, current_odom_pose)) {
@@ -2150,7 +2292,7 @@ private:
           if (has_deterministic_initial_guess) {
             recovery_reference = deterministic_initial_guess;
           }
-        } else if (degraded_odom_active_) {
+        } else if (degraded_odom_active_ && !recovery_verification_active_) {
           recovery_reference_agrees = recovery_pose_agrees_with_prediction(
             candidate_pose, rclcpp::Time(stamp),
             &recovery_consistency_max_xy, &recovery_consistency_max_yaw_deg);
@@ -2268,6 +2410,7 @@ private:
             recovery_verification_from_gnss_ = false;
             has_recovery_verification_anchor_ = false;
             has_recovery_verification_offset_ = false;
+            recovery_attempts_in_episode_ = 0;
           }
         } else {
           const bool aborted_recovery_candidate = recovery_verification_active_;
@@ -2278,6 +2421,7 @@ private:
           has_recovery_verification_offset_ = false;
           if (aborted_recovery_candidate) {
             is_init_success_ = true;
+            last_recovery_completion_time_ = get_clock()->now();
             RCLCPP_WARN(get_logger(),
               "Stateless recovery verification failed; candidate discarded without changing UKF or map->odom");
           }
@@ -2328,6 +2472,7 @@ private:
           degraded_odom_active_ = false;
           degraded_odom_blocked_ = false;
           degraded_odom_stationary_episode_ = false;
+          recovery_attempts_in_episode_ = 0;
           RCLCPP_INFO(get_logger(),
             "Leaving DEGRADED_ODOM: recovery passed consecutive-scan verification");
         }
@@ -2456,6 +2601,8 @@ private:
     last_odom_prediction_stamp_ns_ = 0;
     last_main_ukf_imu_stamp_ns_ = 0;
     last_recovery_search_time_ = rclcpp::Time(0, 0, stamp.get_clock_type());
+    last_recovery_completion_time_ = rclcpp::Time(0, 0, stamp.get_clock_type());
+    recovery_attempts_in_episode_ = 0;
     global_localization_in_progress_ = false;
 
     Eigen::Matrix4f bootstrap_map_to_odom = Eigen::Matrix4f::Identity();
@@ -2564,13 +2711,7 @@ private:
       std::lock_guard<std::mutex> lock(fused_prediction_mutex_);
       if (fused_prediction_state_.stamp_ns == 0) return;
       state = fused_prediction_state_;
-      const bool motor_twist_fresh = latest_motor_twist_stamp_ns_ != 0 &&
-        std::abs(static_cast<double>(state.stamp_ns - latest_motor_twist_stamp_ns_) * 1e-9) <=
-          motor_twist_stale_timeout_sec_;
-      if (motor_twist_fresh) {
-        velocity_x = latest_motor_vx_;
-        velocity_y = latest_motor_vy_;
-      }
+      motor_twist_at_locked(state.stamp_ns, velocity_x, velocity_y);
     }
 
     float yaw_rate = 0.0f;
@@ -3233,8 +3374,12 @@ private:
     }
     {
       std::lock_guard<std::mutex> lock(fused_prediction_mutex_);
-      status.odom_prediction_age_sec = latest_motor_twist_stamp_ns_ == 0 ? -1.0 :
-        static_cast<double>(scan_stamp_ns - latest_motor_twist_stamp_ns_) * 1e-9;
+      float ignored_vx = 0.0f;
+      float ignored_vy = 0.0f;
+      double causal_age_sec = -1.0;
+      motor_twist_at_locked(
+        scan_stamp_ns, ignored_vx, ignored_vy, &causal_age_sec);
+      status.odom_prediction_age_sec = causal_age_sec;
       status.motor_odom_received = motor_odom_received_count_;
       status.motor_odom_duplicates = motor_odom_duplicate_count_;
       status.motor_odom_out_of_order = motor_odom_out_of_order_count_;
@@ -3650,7 +3795,9 @@ private:
 }  // namespace localization
 
 int main(int argc, char** argv) {
-  omp_set_num_threads(6);
+  // Keep generic OpenMP work within the same budget as the foreground NDT.
+  // Recovery uses its own smaller registration thread pool.
+  omp_set_num_threads(4);
   rclcpp::init(argc, argv);
   auto node = std::make_shared<localization::HdlLocalizationNode>(rclcpp::NodeOptions());
 

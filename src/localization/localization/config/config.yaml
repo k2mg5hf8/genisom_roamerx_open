@@ -101,11 +101,17 @@ localization:
     # while /front_lidar remains 10 Hz for Nav2 costmaps.
     localization_scan_min_interval_sec: 0.25
     # Continuous predictor: motor twist supplies planar velocity while IMU
-    # supplies yaw rate. Absolute /odom/mc_odom pose is diagnostic only.
+    # supplies yaw rate. The motor pose origin is ignored, but its yaw keeps
+    # the vendor fixed/world velocity axes aligned after robot turns.
     # Unique vendor stamps arrive at about 16 Hz but occasionally have
     # 0.2-0.34 s gaps. Duplicate messages remain ignored.
     motor_twist_stale_timeout_sec: 0.35
     motor_twist_filter_alpha: 0.25
+    motor_odom_alignment_tracking_enabled: true
+    motor_odom_alignment_filter_alpha: 0.10
+    # Optional measured correction around Z. Keep zero unless a straight-line
+    # validation bag proves a residual fixed angular offset.
+    motor_odom_alignment_yaw_offset_deg: 0.0
     local_odom_publish_rate_hz: 50.0
     fused_prediction_translation_margin: 0.05
     fused_prediction_max_speed: 0.75
@@ -114,13 +120,23 @@ localization:
     # using motor odometry. Run broad recovery only after this grace period.
     degraded_odom_timeout_sec: 3.0
     recovery_search_cooldown_sec: 3.0
+    # Retry delay doubles after each completed search/verification and is
+    # capped. A permanently ambiguous scene cannot consume CPU forever.
+    recovery_retry_backoff_max_sec: 30.0
+    recovery_max_attempts_per_episode: 6
+    # Leave cores available for callbacks, ROS recording and Nav2 on the
+    # 8-core Jetson. Recovery remains lower priority than normal tracking.
+    main_ndt_num_threads: 4
+    recovery_ndt_num_threads: 2
     # Motor odometry can under-estimate displacement during a slipping turn.
     # Keep recovery local, then require six mutually consistent NDT scans.
     recovery_max_odom_xy_error: 1.0
     recovery_max_odom_yaw_error_deg: 20.0
     recovery_max_fitness_score: 0.14
     # A background candidate remains provisional until six consecutive scans
-    # agree with both fused odometry and the preceding recovery offset.
+    # agree with the propagated recovery anchor and each other. The candidate
+    # already passed the fused-odometry gate in the background search; that
+    # same hard boundary is intentionally not applied a second time.
     recovery_verification_count_threshold: 6
     recovery_verification_max_fitness_score: 0.25
     recovery_verification_max_xy_spread: 0.08
