@@ -637,10 +637,20 @@ private:
       output.available = true;
       return output;
     }
-    if (pose_estimator) {
+    if (pose_estimator && pose_estimator->state_is_finite()) {
       output.pose = pose_estimator->matrix();
       if (is_init_success_) output.velocity = pose_estimator->vel();
-      output.available = true;
+      if (output.pose.allFinite() && output.velocity.allFinite()) {
+        output.available = true;
+        return output;
+      }
+    }
+    if (pose_estimator) {
+      output.status = 4;
+      if (has_reliable_pose_ && last_reliable_pose_.allFinite()) {
+        output.pose = last_reliable_pose_;
+        output.available = true;
+      }
       return output;
     }
     if (has_reliable_pose_) {
@@ -2206,6 +2216,15 @@ private:
       pubDefaultLocalizationOdom(points_msg->header.stamp);
       return;
     }
+    if (!pose_estimator->state_is_finite()) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Localization estimator contains NaN/Inf before scan prediction; "
+        "publishing non-navigable output instead of entering NDT");
+      localization_state_ = 4;
+      pubDefaultLocalizationOdom(points_msg->header.stamp);
+      return;
+    }
     apply_static_imu_biases_to_estimator();
     if (!global_map_points_ptr_ || global_map_points_ptr_->empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5.0, "Radar CallBack Waiting for Globalmap Input!!");
@@ -2327,6 +2346,15 @@ private:
         future_queue_size, prediction_age);
     }
     auto t_predict = std::chrono::high_resolution_clock::now();
+
+    if (!pose_estimator->state_is_finite()) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Localization prediction produced NaN/Inf; scan rejected and autonomy blocked");
+      localization_state_ = 4;
+      pubDefaultLocalizationOdom(points_msg->header.stamp);
+      return;
+    }
 
     if (planar_ndt_enabled_ && !recovery_verification_active_) {
       const bool zero_velocity = stationary_constraint_enabled_ &&
@@ -2800,8 +2828,9 @@ private:
     const auto& q = pose_msg->pose.pose.orientation;
     Eigen::Vector3f new_pos(p.x, p.y, p.z);
     Eigen::Quaternionf new_quat(q.w, q.x, q.y, q.z);
-    if (new_quat.norm() < 1e-6f) {
-      RCLCPP_ERROR(get_logger(), "Rejected initial pose with invalid zero quaternion");
+    if (!new_pos.allFinite() || !new_quat.coeffs().allFinite() ||
+        !std::isfinite(new_quat.norm()) || new_quat.norm() < 1e-6f) {
+      RCLCPP_ERROR(get_logger(), "Rejected initial pose with NaN/Inf or invalid quaternion");
       return;
     }
     new_quat.normalize();
@@ -2945,6 +2974,12 @@ private:
   void publish_odometry(
     const rclcpp::Time& stamp, const Eigen::Matrix4f& pose,
     bool pose_available = true, bool update_map_to_odom = false) {
+    if (!pose.allFinite()) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Refusing to publish non-finite localization odometry/TF");
+      return;
+    }
     // RCLCPP_INFO(
     //   get_logger(),
     //   "[publish_odometry] stamp_ns=%ld now_ns=%ld send_tf_transforms=%s frame_id=%s child_frame_id=%s pose_xyz=[%.3f, %.3f, %.3f]",
@@ -3605,6 +3640,21 @@ private:
                     output.pose = last_pose_;
                     output.velocity = last_velocity_;
                     output.available = true;
+                }
+            }
+            if ((output.available && !output.pose.allFinite()) ||
+                !output.velocity.allFinite()) {
+                RCLCPP_ERROR_THROTTLE(
+                  get_logger(), *get_clock(), 1000,
+                  "Non-finite localization output suppressed; reporting DEGRADED");
+                output.status = 4;
+                output.velocity.setZero();
+                if (has_reliable_pose_ && last_reliable_pose_.allFinite()) {
+                    output.pose = last_reliable_pose_;
+                    output.available = true;
+                } else {
+                    output.pose = Eigen::Matrix4f::Identity();
+                    output.available = false;
                 }
             }
         }

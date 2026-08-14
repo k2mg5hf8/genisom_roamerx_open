@@ -7,6 +7,9 @@
 #define KKL_UNSCENTED_KALMAN_FILTER_X_HPP
 
 #include <random>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <Eigen/Dense>
 
 namespace kkl {
@@ -174,7 +177,10 @@ public:
       sigma += ext_weights[i] * (diffA * diffB.transpose());
     }
 
-    kalman_gain = sigma * expected_measurement_cov.inverse();
+    ensurePositiveFinite(expected_measurement_cov);
+    Eigen::LDLT<MatrixXt> measurement_solver(expected_measurement_cov);
+    kalman_gain = sigma * measurement_solver.solve(
+      MatrixXt::Identity(K, K));
     const auto& K = kalman_gain;
 
     VectorXt ext_mean = ext_mean_pred + K * (measurement - expected_measurement_mean);
@@ -182,6 +188,7 @@ public:
 
     mean = ext_mean.topLeftCorner(N, 1);
     cov = ext_cov.topLeftCorner(N, N);
+    ensurePositiveFinite(cov);
   }
 
   /*			getter			*/
@@ -244,6 +251,12 @@ private:
 
     Eigen::LLT<MatrixXt> llt;
     llt.compute((n + lambda) * cov);
+    if (llt.info() != Eigen::Success) {
+      MatrixXt regularized = cov;
+      ensurePositiveFinite(regularized);
+      regularized.diagonal().array() += covariance_floor();
+      llt.compute((n + lambda) * regularized);
+    }
     MatrixXt l = llt.matrixL();
 
     sigma_points.row(0) = mean;
@@ -258,19 +271,33 @@ private:
    * @param cov  covariance matrix
    */
   void ensurePositiveFinite(MatrixXt& cov) {
-    return;
-    const double eps = 1e-9;
-
-    Eigen::EigenSolver<MatrixXt> solver(cov);
-    MatrixXt D = solver.pseudoEigenvalueMatrix();
-    MatrixXt V = solver.pseudoEigenvectors();
-    for (int i = 0; i < D.rows(); i++) {
-      if (D(i, i) < eps) {
-        D(i, i) = eps;
-      }
+    const T floor = covariance_floor();
+    if (cov.rows() == 0 || cov.rows() != cov.cols()) {
+      return;
+    }
+    if (!cov.allFinite()) {
+      cov = MatrixXt::Identity(cov.rows(), cov.cols()) * floor;
+      return;
     }
 
-    cov = V * D * V.inverse();
+    cov = (cov + cov.transpose()) * T(0.5);
+    Eigen::SelfAdjointEigenSolver<MatrixXt> solver(cov);
+    if (solver.info() != Eigen::Success ||
+        !solver.eigenvalues().allFinite() ||
+        !solver.eigenvectors().allFinite()) {
+      cov = MatrixXt::Identity(cov.rows(), cov.cols()) * floor;
+      return;
+    }
+
+    VectorXt eigenvalues = solver.eigenvalues().cwiseMax(floor);
+    cov = solver.eigenvectors() * eigenvalues.asDiagonal() *
+      solver.eigenvectors().transpose();
+    cov = (cov + cov.transpose()) * T(0.5);
+  }
+
+  static constexpr T covariance_floor() {
+    return std::max<T>(
+      T(1e-6), std::numeric_limits<T>::epsilon() * T(100));
   }
 
 public:

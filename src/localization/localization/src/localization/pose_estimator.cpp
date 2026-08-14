@@ -74,7 +74,21 @@ void PoseEstimator::predict(const rclcpp::Time& stamp) {
   ukf->setProcessNoiseCov(process_noise * dt);
   ukf->system.dt = dt;
 
+  const Eigen::VectorXf mean_before = ukf->mean;
+  const Eigen::MatrixXf cov_before = ukf->cov;
   ukf->predict();
+  Eigen::Vector4f predicted_quat = ukf->mean.middleRows(6, 4);
+  if (predicted_quat.allFinite() && predicted_quat.norm() > 1e-6f) {
+    ukf->mean.middleRows(6, 4) = predicted_quat.normalized();
+  }
+  if (!ukf->mean.allFinite() || !ukf->cov.allFinite() ||
+      !predicted_quat.allFinite() || predicted_quat.norm() < 1e-6f) {
+    ukf->mean = mean_before;
+    ukf->cov = cov_before;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "UKF prediction produced NaN/Inf; previous state restored");
+  }
 }
 
 /**
@@ -103,6 +117,13 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
   }
   prev_stamp = stamp;
 
+  if (!acc.allFinite() || !gyro.allFinite()) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Ignoring IMU prediction with NaN/Inf input");
+    return;
+  }
+
   ukf->setProcessNoiseCov(process_noise * dt);
   ukf->system.dt = dt;
 
@@ -110,7 +131,21 @@ void PoseEstimator::predict(const rclcpp::Time& stamp, const Eigen::Vector3f& ac
   control.head<3>() = acc;
   control.tail<3>() = gyro;
   
+  const Eigen::VectorXf mean_before = ukf->mean;
+  const Eigen::MatrixXf cov_before = ukf->cov;
   ukf->predict(control);
+  Eigen::Vector4f predicted_quat = ukf->mean.middleRows(6, 4);
+  if (predicted_quat.allFinite() && predicted_quat.norm() > 1e-6f) {
+    ukf->mean.middleRows(6, 4) = predicted_quat.normalized();
+  }
+  if (!ukf->mean.allFinite() || !ukf->cov.allFinite() ||
+      !predicted_quat.allFinite() || predicted_quat.norm() < 1e-6f) {
+    ukf->mean = mean_before;
+    ukf->cov = cov_before;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "IMU UKF prediction produced NaN/Inf; previous state restored");
+  }
   
 }
 
@@ -149,6 +184,13 @@ void PoseEstimator::apply_planar_constraint(
  * @brief update the state of the odomety-based pose estimation
  */
 void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
+  if (!odom_delta.allFinite()) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Ignoring odometry prediction with NaN/Inf delta");
+    odom_prediction_available_ = false;
+    return;
+  }
   if(!odom_ukf) {
     Eigen::MatrixXf odom_process_noise = Eigen::MatrixXf::Identity(7, 7);
     Eigen::MatrixXf odom_measurement_noise = Eigen::MatrixXf::Identity(7, 7) * 1e-3;
@@ -181,7 +223,23 @@ void PoseEstimator::predict_odom(const Eigen::Matrix4f& odom_delta) {
   process_noise.bottomRightCorner(4, 4) = Eigen::Matrix4f::Identity() * (1 - std::abs(quat.w())) + Eigen::Matrix4f::Identity() * 1e-3;
 
   odom_ukf->setProcessNoiseCov(process_noise);
+  const Eigen::VectorXf mean_before = odom_ukf->mean;
+  const Eigen::MatrixXf cov_before = odom_ukf->cov;
   odom_ukf->predict(control);
+  Eigen::Vector4f predicted_quat = odom_ukf->mean.middleRows(3, 4);
+  if (predicted_quat.allFinite() && predicted_quat.norm() > 1e-6f) {
+    odom_ukf->mean.middleRows(3, 4) = predicted_quat.normalized();
+  }
+  if (!odom_ukf->mean.allFinite() || !odom_ukf->cov.allFinite() ||
+      !predicted_quat.allFinite() || predicted_quat.norm() < 1e-6f) {
+    odom_ukf->mean = mean_before;
+    odom_ukf->cov = cov_before;
+    odom_prediction_available_ = false;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Odometry UKF prediction produced NaN/Inf; previous state restored");
+    return;
+  }
   odom_prediction_available_ = true;
 }
 
@@ -218,6 +276,22 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     init_guess = *initial_guess_override;
   }
   correction_diagnostics_ = CorrectionDiagnostics{};
+  if (!init_guess.allFinite()) {
+    const Eigen::Matrix4f safe_guess =
+      last_observation.allFinite() ? last_observation : Eigen::Matrix4f::Identity();
+    correction_diagnostics_.initial_guess = safe_guess;
+    correction_diagnostics_.candidate_pose = safe_guess;
+    correction_diagnostics_.rejection_reason = "non_finite_initial_guess";
+    match_result_.is_converged_ = false;
+    match_result_.fitness_score_ = std::numeric_limits<float>::infinity();
+    pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
+    pcl::transformPointCloud(*cloud, *aligned, safe_guess);
+    odom_prediction_available_ = false;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Rejecting scan before NDT: initial guess contains NaN/Inf");
+    return aligned;
+  }
   correction_diagnostics_.initial_guess = init_guess;
   // Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
 
@@ -260,8 +334,33 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   double ndt_score = registration->getFitnessScore();
 
   Eigen::Matrix4f trans = registration->getFinalTransformation();
+  if (!trans.allFinite()) {
+    correction_diagnostics_.rejection_reason = "non_finite_transform";
+    match_result_.is_converged_ = false;
+    match_result_.fitness_score_ = std::isfinite(ndt_score) ?
+      static_cast<float>(ndt_score) : std::numeric_limits<float>::infinity();
+    pcl::transformPointCloud(*cloud, *aligned, init_guess);
+    odom_prediction_available_ = false;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Rejecting NDT correction: final transform contains NaN/Inf");
+    return aligned;
+  }
   Eigen::Vector3f p = trans.block<3, 1>(0, 3);
   Eigen::Quaternionf q(trans.block<3, 3>(0, 0));
+  if (!p.allFinite() || !q.coeffs().allFinite() ||
+      !std::isfinite(q.norm()) || q.norm() < 1e-6f) {
+    correction_diagnostics_.rejection_reason = "invalid_candidate_pose";
+    match_result_.is_converged_ = false;
+    match_result_.fitness_score_ = std::isfinite(ndt_score) ?
+      static_cast<float>(ndt_score) : std::numeric_limits<float>::infinity();
+    pcl::transformPointCloud(*cloud, *aligned, init_guess);
+    odom_prediction_available_ = false;
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Rejecting NDT correction: candidate pose is not finite/normalizable");
+    return aligned;
+  }
 
   if (planar_correction_enabled_) {
     const Eigen::Matrix3f initial_rotation = init_guess.block<3, 3>(0, 0);
@@ -291,13 +390,18 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   bool converged = registration->hasConverged();
   bool valid_score = std::isfinite(ndt_score) && ndt_score < max_fitness_score_;
 
-  if (!converged || !valid_score || xy_jump > max_xy_jump_ || yaw_jump > max_yaw_jump_) {
+  const bool finite_innovation =
+    std::isfinite(xy_jump) && std::isfinite(yaw_jump);
+  if (!converged || !valid_score || !finite_innovation ||
+      xy_jump > max_xy_jump_ || yaw_jump > max_yaw_jump_) {
     if (!converged) {
       correction_diagnostics_.rejection_reason = "not_converged";
     } else if (!std::isfinite(ndt_score)) {
       correction_diagnostics_.rejection_reason = "non_finite_fitness";
     } else if (!valid_score) {
       correction_diagnostics_.rejection_reason = "fitness_gate";
+    } else if (!finite_innovation) {
+      correction_diagnostics_.rejection_reason = "non_finite_innovation";
     } else if (xy_jump > max_xy_jump_) {
       correction_diagnostics_.rejection_reason = "xy_jump_gate";
     } else {
@@ -345,12 +449,11 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     return aligned;
   }
 
-  match_result_.is_converged_ = true;
-  match_result_.fitness_score_ = static_cast<float>(ndt_score);
-  correction_diagnostics_.accepted = true;
-  correction_diagnostics_.rejection_reason.clear();
-
   if (!commit_correction) {
+    match_result_.is_converged_ = true;
+    match_result_.fitness_score_ = static_cast<float>(ndt_score);
+    correction_diagnostics_.accepted = true;
+    correction_diagnostics_.rejection_reason.clear();
     odom_prediction_available_ = false;
     return aligned;
   }
@@ -358,12 +461,22 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   Eigen::VectorXf observation(7);
   observation.middleRows(0, 3) = p;
   observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
-  last_observation = candidate_pose;
+  const Eigen::VectorXf ukf_mean_before = ukf->mean;
+  const Eigen::MatrixXf ukf_cov_before = ukf->cov;
+  Eigen::VectorXf odom_mean_before;
+  Eigen::MatrixXf odom_cov_before;
+  if (odom_ukf) {
+    odom_mean_before = odom_ukf->mean;
+    odom_cov_before = odom_ukf->cov;
+  }
 
   // wo_pred_error = no_guess.inverse() * registration->getFinalTransformation();
-
   ukf->correct(observation);
-  ukf->mean[5] = 0.0f; 
+  ukf->mean[5] = 0.0f;
+  Eigen::Vector4f corrected_quat = ukf->mean.middleRows(6, 4);
+  if (corrected_quat.allFinite() && corrected_quat.norm() > 1e-6f) {
+    ukf->mean.middleRows(6, 4) = corrected_quat.normalized();
+  }
   // imu_pred_error = imu_guess.inverse() * registration->getFinalTransformation();
 
   if(odom_ukf) {
@@ -372,6 +485,10 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     }
 
     odom_ukf->correct(observation);
+    Eigen::Vector4f corrected_odom_quat = odom_ukf->mean.middleRows(3, 4);
+    if (corrected_odom_quat.allFinite() && corrected_odom_quat.norm() > 1e-6f) {
+      odom_ukf->mean.middleRows(3, 4) = corrected_odom_quat.normalized();
+    }
     if (odom_prediction_available_) {
       odom_pred_error = odom_guess.inverse() * candidate_pose;
     } else {
@@ -379,6 +496,30 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
     }
   }
   odom_prediction_available_ = false;
+
+  if (!state_is_finite()) {
+    ukf->mean = ukf_mean_before;
+    ukf->cov = ukf_cov_before;
+    if (odom_ukf) {
+      odom_ukf->mean = odom_mean_before;
+      odom_ukf->cov = odom_cov_before;
+    }
+    match_result_.is_converged_ = false;
+    match_result_.fitness_score_ = static_cast<float>(ndt_score);
+    correction_diagnostics_.accepted = false;
+    correction_diagnostics_.rejection_reason = "non_finite_filter_update";
+    pcl::transformPointCloud(*cloud, *aligned, init_guess);
+    RCLCPP_ERROR(
+      rclcpp::get_logger("PoseEstimator"),
+      "Rejecting NDT correction: UKF update produced NaN/Inf; previous state restored");
+    return aligned;
+  }
+
+  last_observation = candidate_pose;
+  match_result_.is_converged_ = true;
+  match_result_.fitness_score_ = static_cast<float>(ndt_score);
+  correction_diagnostics_.accepted = true;
+  correction_diagnostics_.rejection_reason.clear();
 
   return aligned;
 }
@@ -405,6 +546,18 @@ Eigen::Matrix4f PoseEstimator::matrix() const {
   m.block<3, 3>(0, 0) = quat().toRotationMatrix();
   m.block<3, 1>(0, 3) = pos();
   return m;
+}
+
+bool PoseEstimator::state_is_finite() const {
+  const auto filter_is_finite = [](const auto& filter, int quaternion_offset) {
+    if (!filter || !filter->mean.allFinite() || !filter->cov.allFinite()) {
+      return false;
+    }
+    const Eigen::Vector4f q = filter->mean.middleRows(quaternion_offset, 4);
+    return q.allFinite() && std::isfinite(q.norm()) && q.norm() > 1e-6f;
+  };
+  return filter_is_finite(ukf, 6) &&
+    (!odom_ukf || filter_is_finite(odom_ukf, 3));
 }
 
 Eigen::Matrix<float, 6, 6> PoseEstimator::pose_covariance() const {

@@ -126,10 +126,16 @@ local_costmap:
         plugin: "navigo_costmap_2d::ObstacleLayer"
         enabled: True
         footprint_clearing_enabled: true
-        observation_persistence: 0.0
         observation_sources: lidar
         lidar:
           topic: /front_lidar_filtered
+          # Expire a frozen cloud instead of raytracing forever from a stale
+          # sensor origin after a subscription/TF stall.
+          observation_persistence: 1.0
+          # The filtered LiDAR normally updates near 10 Hz. Mark the costmap
+          # non-current (and stop the controller) if no valid observation has
+          # reached this source buffer for 0.5 s.
+          expected_update_rate: 0.5
           max_obstacle_height: 2.0
           clearing: True
           marking: True

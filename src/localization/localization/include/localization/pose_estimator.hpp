@@ -108,6 +108,7 @@ public:
   Eigen::Quaternionf quat() const;
   Eigen::Matrix4f matrix() const;
   Eigen::Matrix<float, 6, 6> pose_covariance() const;
+  bool state_is_finite() const;
 
   Eigen::Vector3f odom_pos() const;
   Eigen::Quaternionf odom_quat() const;
