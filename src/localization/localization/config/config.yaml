@@ -60,7 +60,7 @@ localization:
     deskew_timestamp_scale_sec: 1.0e-9
     deskew_min_coverage: 0.90
     globalmap_voxel_size: 0.3
-    points_voxel_filter_size: 0.30
+    points_voxel_filter_size: 0.40
 
     # other parameters
     cool_time_duration: 0.3

@@ -134,8 +134,8 @@ local_costmap:
           observation_persistence: 1.0
           # The filtered LiDAR normally updates near 10 Hz. Mark the costmap
           # non-current (and stop the controller) if no valid observation has
-          # reached this source buffer for 0.5 s.
-          expected_update_rate: 0.5
+          # reached this source buffer for 1.0 s.
+          expected_update_rate: 1.0
           max_obstacle_height: 2.0
           clearing: True
           marking: True
