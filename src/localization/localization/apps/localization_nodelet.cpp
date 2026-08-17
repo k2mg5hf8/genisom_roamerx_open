@@ -162,7 +162,7 @@ public:
         declare_parameter<int>("tracking_degraded_count_threshold", 2)));
     declare_parameter<float>("init_match_score_threshold", 0.15);
     get_parameter("init_match_score_threshold", init_match_score_threshold_);
-    tracking_max_xy_jump_ = static_cast<float>(declare_parameter<double>("tracking_max_xy_jump", 0.3));
+    tracking_max_xy_jump_ = static_cast<float>(declare_parameter<double>("tracking_max_xy_jump", 0.4));
     tracking_max_yaw_jump_deg_ = static_cast<float>(declare_parameter<double>("tracking_max_yaw_jump_deg", 15.0));
     reliable_threshold_ = static_cast<float>(declare_parameter<double>("tracking_max_fitness_score", 0.25));
     planar_ndt_enabled_ = declare_parameter<bool>("planar_ndt_enabled", true);
@@ -219,7 +219,7 @@ public:
       1, static_cast<int>(
         declare_parameter<int>("recovery_ndt_num_threads", 2)));
     recovery_max_odom_xy_error_ = static_cast<float>(
-      declare_parameter<double>("recovery_max_odom_xy_error", 1.0));
+      declare_parameter<double>("recovery_max_odom_xy_error", 1.25));
     recovery_max_odom_yaw_error_deg_ = static_cast<float>(
       declare_parameter<double>("recovery_max_odom_yaw_error_deg", 20.0));
     recovery_max_fitness_score_ = static_cast<float>(
@@ -501,7 +501,7 @@ private:
   int tracking_degraded_count_threshold_ = 2;
   float init_match_score_threshold_ = 0.2f;
   float reliable_threshold_ = 0.25f;
-  float tracking_max_xy_jump_ = 0.3f;
+  float tracking_max_xy_jump_ = 0.4f;
   float tracking_max_yaw_jump_deg_ = 15.0f;
   bool planar_ndt_enabled_ = true;
   double localization_scan_min_interval_sec_ = 0.18;
@@ -532,7 +532,7 @@ private:
   int main_ndt_num_threads_ = 4;
   int recovery_ndt_num_threads_ = 2;
   double degraded_odom_timeout_sec_ = 3.0;
-  float recovery_max_odom_xy_error_ = 1.0f;
+  float recovery_max_odom_xy_error_ = 1.25f;
   float recovery_max_odom_yaw_error_deg_ = 20.0f;
   float recovery_max_fitness_score_ = 0.14f;
   int recovery_verification_count_threshold_ = 6;
