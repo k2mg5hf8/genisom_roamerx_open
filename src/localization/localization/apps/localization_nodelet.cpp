@@ -159,7 +159,12 @@ public:
     bad__match_count_threshold_ = declare_parameter<int>("bad_match_count_threshold", 6);
     tracking_degraded_count_threshold_ = std::max(
       1, static_cast<int>(
-        declare_parameter<int>("tracking_degraded_count_threshold", 2)));
+        declare_parameter<int>("tracking_degraded_count_threshold", 4)));
+    tracking_severe_degraded_count_threshold_ = std::max(
+      1, static_cast<int>(
+        declare_parameter<int>("tracking_severe_degraded_count_threshold", 2)));
+    tracking_severe_fitness_score_ = static_cast<float>(
+      declare_parameter<double>("tracking_severe_fitness_score", 0.5));
     declare_parameter<float>("init_match_score_threshold", 0.15);
     get_parameter("init_match_score_threshold", init_match_score_threshold_);
     tracking_max_xy_jump_ = static_cast<float>(declare_parameter<double>("tracking_max_xy_jump", 0.4));
@@ -498,7 +503,9 @@ private:
   // Initial pose initialization parameters
   int init_match_count_threshold_ = 5;
   int bad__match_count_threshold_ = 6;
-  int tracking_degraded_count_threshold_ = 2;
+  int tracking_degraded_count_threshold_ = 4;
+  int tracking_severe_degraded_count_threshold_ = 2;
+  float tracking_severe_fitness_score_ = 0.5f;
   float init_match_score_threshold_ = 0.2f;
   float reliable_threshold_ = 0.25f;
   float tracking_max_xy_jump_ = 0.4f;
@@ -579,6 +586,7 @@ private:
   struct RecoveryResult {
     bool found = false;
     bool from_gnss = false;
+    uint64_t episode_id = 0;
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f reference_pose = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f source_odom_pose = Eigen::Matrix4f::Identity();
@@ -745,6 +753,9 @@ private:
   Eigen::Matrix4f initialization_hold_pose_{Eigen::Matrix4f::Identity()};
   bool recovery_verification_active_ = false;
   bool recovery_verification_from_gnss_ = false;
+  bool recovery_verification_from_local_tracking_ = false;
+  bool local_recovery_attempted_ = false;
+  uint64_t recovery_episode_id_ = 0;
   float recovery_verification_reference_max_xy_ = 0.0f;
   float recovery_verification_reference_max_yaw_deg_ = 0.0f;
   bool has_recovery_verification_anchor_ = false;
@@ -1107,10 +1118,15 @@ private:
   void set_recovery_verification_correction_limits() {
     if (pose_estimator) {
       pose_estimator->set_planar_correction(planar_ndt_enabled_);
+      const bool local_tracking = recovery_verification_from_local_tracking_;
       pose_estimator->set_correction_limits(
-        5.0f,
-        std::numeric_limits<float>::infinity(),
-        recovery_verification_max_fitness_score_);
+        local_tracking ? recovery_verification_reference_max_xy_ : 5.0f,
+        local_tracking ?
+          recovery_verification_reference_max_yaw_deg_ *
+            static_cast<float>(M_PI) / 180.0f :
+          std::numeric_limits<float>::infinity(),
+        local_tracking ? recovery_max_fitness_score_ :
+          recovery_verification_max_fitness_score_);
     }
   }
 
@@ -1942,7 +1958,9 @@ private:
   void enter_degraded_odom(const rclcpp::Time& stamp) {
     if (degraded_odom_active_ || !has_reliable_pose_) return;
     degraded_odom_active_ = true;
+    ++recovery_episode_id_;
     recovery_attempts_in_episode_ = 0;
+    local_recovery_attempted_ = false;
     last_recovery_completion_time_ = rclcpp::Time(0, 0, stamp.get_clock_type());
     degraded_odom_blocked_ = false;
     degraded_odom_stationary_episode_ = robot_is_stationary_for_recovery(stamp);
@@ -1995,6 +2013,50 @@ private:
     }
   }
 
+  void start_local_recovery_verification(const rclcpp::Time& stamp) {
+    if (!degraded_odom_active_ || recovery_verification_active_ ||
+        local_recovery_attempted_ || !pose_estimator) {
+      return;
+    }
+    local_recovery_attempted_ = true;
+
+    Eigen::Matrix4f current_odom_pose;
+    if (!lookup_odom_pose(stamp, current_odom_pose)) {
+      RCLCPP_WARN(get_logger(),
+        "Fast local recovery skipped: fused pose is unavailable at verification start");
+      return;
+    }
+
+    const bool stationary = degraded_odom_stationary_episode_ &&
+      robot_is_stationary_for_recovery(stamp);
+    recovery_verification_reference_max_xy_ = stationary ?
+      recovery_stationary_max_xy_error_ : recovery_max_odom_xy_error_;
+    recovery_verification_reference_max_yaw_deg_ = stationary ?
+      recovery_stationary_max_yaw_error_deg_ : recovery_max_odom_yaw_error_deg_;
+
+    // Keep the public degraded pose unchanged while local NDT candidates are
+    // checked without mutating either UKF. The anchor makes every candidate
+    // offset relative to the same causal fused-odometry prediction.
+    initialization_hold_pose_ = degraded_pose_;
+    has_initialization_hold_pose_ = true;
+    recovery_verification_anchor_map_pose_ = degraded_pose_;
+    recovery_verification_anchor_odom_pose_ = current_odom_pose;
+    has_recovery_verification_anchor_ = true;
+    is_init_success_ = false;
+    init_match_count_ = 0;
+    recovery_verification_active_ = true;
+    recovery_verification_from_gnss_ = false;
+    recovery_verification_from_local_tracking_ = true;
+    has_recovery_verification_offset_ = false;
+    set_recovery_verification_correction_limits();
+    RCLCPP_WARN(get_logger(),
+      "Fast local recovery started: stateless %d-scan verification, limits=%.3f m/%.1f deg score<=%.3f",
+      recovery_verification_count_threshold_,
+      recovery_verification_reference_max_xy_,
+      recovery_verification_reference_max_yaw_deg_,
+      recovery_max_fitness_score_);
+  }
+
   void start_recovery_search(const pcl::PointCloud<PointT>::Ptr& cloud,
                              const Eigen::Matrix4f& expected_pose,
                              const rclcpp::Time& source_stamp) {
@@ -2039,6 +2101,7 @@ private:
       return;
     }
     const int64_t source_stamp_ns = source_stamp.nanoseconds();
+    const uint64_t recovery_episode_id = recovery_episode_id_;
     const GnssRecoverySeed gnss_seed =
       gnss_recovery_seed(expected_pose, source_stamp);
     ++recovery_attempts_in_episode_;
@@ -2047,9 +2110,10 @@ private:
     recovery_future_ = std::async(std::launch::async,
       [this, cloud_copy, map, expected_pose, max_xy, max_yaw, max_score,
        planar_z, planar_roll, planar_pitch, source_odom_pose, source_stamp_ns,
-       gnss_seed]() {
+       recovery_episode_id, gnss_seed]() {
         auto recovery_registration = create_registration(recovery_ndt_num_threads_);
         RecoveryResult unavailable;
+        unavailable.episode_id = recovery_episode_id;
         unavailable.source_odom_pose = source_odom_pose;
         unavailable.source_stamp_ns = source_stamp_ns;
         if (!recovery_registration) return unavailable;
@@ -2062,6 +2126,7 @@ private:
               double candidate_translation_scale) {
             RecoveryResult result;
             result.from_gnss = from_gnss;
+            result.episode_id = recovery_episode_id;
             result.reference_pose = seed_pose;
             result.source_odom_pose = source_odom_pose;
             result.source_stamp_ns = source_stamp_ns;
@@ -2140,6 +2205,13 @@ private:
         recovery_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
     const RecoveryResult result = recovery_future_.get();
     last_recovery_completion_time_ = get_clock()->now();
+    if (result.episode_id != recovery_episode_id_) {
+      RCLCPP_WARN(get_logger(),
+        "Discarding stale background recovery result from episode %llu; current episode is %llu",
+        static_cast<unsigned long long>(result.episode_id),
+        static_cast<unsigned long long>(recovery_episode_id_));
+      return false;
+    }
     if (!degraded_odom_active_) return false;
     Eigen::Matrix4f current_odom_pose;
     if (!lookup_odom_pose(stamp, current_odom_pose)) {
@@ -2181,6 +2253,7 @@ private:
     init_match_count_ = 0;
     recovery_verification_active_ = true;
     recovery_verification_from_gnss_ = result.from_gnss;
+    recovery_verification_from_local_tracking_ = false;
     recovery_verification_reference_max_xy_ = max_xy;
     recovery_verification_reference_max_yaw_deg_ = max_yaw_deg;
     has_recovery_verification_offset_ = false;
@@ -2273,6 +2346,7 @@ private:
         init_match_count_ = 0;
         recovery_verification_active_ = false;
         recovery_verification_from_gnss_ = false;
+        recovery_verification_from_local_tracking_ = false;
         has_recovery_verification_anchor_ = false;
         has_recovery_verification_offset_ = false;
         localization_state_ = 1;
@@ -2423,7 +2497,8 @@ private:
     const int required_matches = recovery_verification_active_ ?
       recovery_verification_count_threshold_ : init_match_count_threshold_;
     const float acceptance_score_threshold = recovery_verification_active_ ?
-      recovery_verification_max_fitness_score_ :
+      (recovery_verification_from_local_tracking_ ? recovery_max_fitness_score_ :
+        recovery_verification_max_fitness_score_) :
       (awaiting_initialization ? init_match_score_threshold_ : reliable_threshold_);
     bool has_candidate_pose = false;
     std::string candidate_rejection_reason;
@@ -2451,7 +2526,7 @@ private:
         }
         bool recovery_reference_agrees = true;
         Eigen::Matrix4f recovery_reference = degraded_pose_;
-        if (degraded_odom_active_ && recovery_verification_from_gnss_) {
+        if (degraded_odom_active_ && recovery_verification_active_) {
           recovery_consistency_max_xy = recovery_verification_reference_max_xy_;
           recovery_consistency_max_yaw_deg =
             recovery_verification_reference_max_yaw_deg_;
@@ -2477,7 +2552,9 @@ private:
             180.0f / static_cast<float>(M_PI);
           RCLCPP_WARN(get_logger(),
             "NDT correction rejected before UKF update by %s consistency gate: score=%.4f xy=%.3f/%.3f m yaw=%.1f/%.1f deg",
-            recovery_verification_from_gnss_ ? "GNSS-seeded" : "fused-prediction",
+            recovery_verification_from_gnss_ ? "GNSS-seeded" :
+              (recovery_verification_from_local_tracking_ ?
+                "fast-local" : "odometry-seeded"),
             score, consistency_xy, recovery_consistency_max_xy,
             consistency_yaw_deg, recovery_consistency_max_yaw_deg);
           candidate_rejection_reason = "recovery_prediction_gate";
@@ -2552,6 +2629,8 @@ private:
           RCLCPP_INFO(get_logger(), "Init match count: %d/%d (score: %.6f)",
                       init_match_count_, required_matches, match_result.fitness_score_);
           if (init_match_count_ >= required_matches) {
+            const bool completed_fast_local_recovery =
+              recovery_verification_from_local_tracking_;
             if (recovery_verification_active_) {
               const Eigen::Matrix4f verified_pose = correction_diagnostics.candidate_pose;
               last_init_pos_ = verified_pose.block<3, 1>(0, 3);
@@ -2579,15 +2658,23 @@ private:
             init_match_count_ = 0;
             recovery_verification_active_ = false;
             recovery_verification_from_gnss_ = false;
+            recovery_verification_from_local_tracking_ = false;
             has_recovery_verification_anchor_ = false;
             has_recovery_verification_offset_ = false;
             recovery_attempts_in_episode_ = 0;
+            if (completed_fast_local_recovery) {
+              RCLCPP_INFO(get_logger(),
+                "Fast local recovery passed stateless consecutive-scan verification");
+            }
           }
         } else {
           const bool aborted_recovery_candidate = recovery_verification_active_;
+          const bool aborted_fast_local_recovery =
+            recovery_verification_from_local_tracking_;
           init_match_count_ = 0;
           recovery_verification_active_ = false;
           recovery_verification_from_gnss_ = false;
+          recovery_verification_from_local_tracking_ = false;
           has_recovery_verification_anchor_ = false;
           has_recovery_verification_offset_ = false;
           if (aborted_recovery_candidate) {
@@ -2598,7 +2685,8 @@ private:
               tracking_max_yaw_jump_deg_ * static_cast<float>(M_PI) / 180.0f,
               reliable_threshold_);
             RCLCPP_WARN(get_logger(),
-              "Stateless recovery verification failed; candidate discarded without changing UKF or map->odom");
+              "%s recovery verification failed; candidate discarded without changing UKF or map->odom",
+              aborted_fast_local_recovery ? "Fast local" : "Stateless");
           }
           RCLCPP_INFO(get_logger(), "Init match criteria not met, resetting counter");
         }
@@ -2617,18 +2705,44 @@ private:
         bad_match_count_++;
         RCLCPP_WARN(get_logger(), "Bad match count: %d/%d (score: %.3f)",
                     bad_match_count_, bad__match_count_threshold_, match_result.fitness_score_);
+        const float rejected_xy =
+          correction_diagnostics.innovation.block<2, 1>(0, 3).norm();
+        const float rejected_yaw_deg = std::abs(std::atan2(
+          correction_diagnostics.innovation(1, 0),
+          correction_diagnostics.innovation(0, 0))) *
+          180.0f / static_cast<float>(M_PI);
+        const bool invalid_or_unsafe_rejection =
+          rejection_reason == "not_converged" ||
+          rejection_reason == "non_finite_transform" ||
+          rejection_reason == "invalid_candidate_pose" ||
+          rejection_reason == "non_finite_fitness" ||
+          rejection_reason == "non_finite_innovation" ||
+          rejection_reason == "non_finite_filter_update" ||
+          rejection_reason == "occupancy_pose_gate" ||
+          rejection_reason == "occupancy_transition_gate";
+        const bool severe_tracking_rejection =
+          invalid_or_unsafe_rejection ||
+          !std::isfinite(match_result.fitness_score_) ||
+          match_result.fitness_score_ >= tracking_severe_fitness_score_ ||
+          !std::isfinite(rejected_xy) || !std::isfinite(rejected_yaw_deg) ||
+          rejected_xy > recovery_max_odom_xy_error_ ||
+          rejected_yaw_deg > recovery_max_odom_yaw_error_deg_;
+        const int degraded_count_threshold = severe_tracking_rejection ?
+          tracking_severe_degraded_count_threshold_ :
+          tracking_degraded_count_threshold_;
         const bool transient_tracking_rejection =
           is_init_success_ && !degraded_odom_active_ && has_reliable_pose_ &&
-          bad_match_count_ < tracking_degraded_count_threshold_;
+          bad_match_count_ < degraded_count_threshold;
         if (transient_tracking_rejection) {
           localization_state_ = 3;
           current_confidence_ = std::min(current_confidence_, 0.5);
           RCLCPP_WARN(get_logger(),
             "Transient NDT rejection %d/%d: retaining fused prediction before DEGRADED_ODOM",
-            bad_match_count_, tracking_degraded_count_threshold_);
+            bad_match_count_, degraded_count_threshold);
         } else if (has_reliable_pose_ || degraded_odom_active_) {
           enter_degraded_odom(rclcpp::Time(stamp));
           update_degraded_odom(rclcpp::Time(stamp));
+          start_local_recovery_verification(rclcpp::Time(stamp));
           localization_state_ = 4;
           if (bad_match_count_ == bad__match_count_threshold_) {
             RCLCPP_ERROR(get_logger(),
@@ -2648,6 +2762,7 @@ private:
           degraded_odom_blocked_ = false;
           degraded_odom_stationary_episode_ = false;
           recovery_attempts_in_episode_ = 0;
+          local_recovery_attempted_ = false;
           RCLCPP_INFO(get_logger(),
             "Leaving DEGRADED_ODOM: recovery passed consecutive-scan verification");
         }
@@ -2747,6 +2862,9 @@ private:
     degraded_odom_stationary_episode_ = false;
     recovery_verification_active_ = false;
     recovery_verification_from_gnss_ = false;
+    recovery_verification_from_local_tracking_ = false;
+    local_recovery_attempted_ = false;
+    ++recovery_episode_id_;
     has_recovery_verification_anchor_ = false;
     has_recovery_verification_offset_ = false;
     has_reliable_odom_pose_ = false;

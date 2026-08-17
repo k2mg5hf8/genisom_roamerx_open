@@ -86,9 +86,16 @@ localization:
 
     # initial pose initialization parameters 
     init_match_count_threshold: 2         
-    # Reject one transient NDT outlier without stopping navigation. Two
-    # consecutive failures enter DEGRADED_ODOM; six mark persistent loss.
-    tracking_degraded_count_threshold: 2
+    # Use hysteresis before stopping navigation; six failures still mark a
+    # persistent loss for diagnostics and background recovery.
+    # At the observed ~3 Hz scan-matching rate, four ordinary consecutive
+    # rejections give roughly one second of hysteresis. This suppresses the
+    # 2-3 scan status-4 flicker seen in the 20260817T175311Z field bag without
+    # hiding a sustained loss. Severe/non-finite failures retain the faster
+    # two-scan fail-stop below.
+    tracking_degraded_count_threshold: 4
+    tracking_severe_degraded_count_threshold: 2
+    tracking_severe_fitness_score: 0.5
     bad_match_count_threshold: 6
     init_match_score_threshold: 0.15      
     # Field bags show otherwise good NDT corrections first crossing the gate at
@@ -149,6 +156,9 @@ localization:
     recovery_max_odom_xy_error: 1.25
     recovery_max_odom_yaw_error_deg: 20.0
     recovery_max_fitness_score: 0.14
+    # On entry to DEGRADED_ODOM, first try the current local NDT seed under the
+    # recovery gates. It remains stateless and must pass the same six-scan
+    # consistency test; global/background NDT remains the fallback.
     # A background candidate remains provisional until six consecutive scans
     # agree with the propagated recovery anchor and each other. Verification
     # temporarily uses its own broad correction limit; otherwise the normal
