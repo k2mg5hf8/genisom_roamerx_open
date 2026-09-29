@@ -6,6 +6,9 @@ localization:
   ros__parameters:
     imu_topic: "/security_robot/imu/central"
     imu_acc_scale: 1.0
+    # The vendor robot_tf (lower PC) and ARC mapping subscribe
+    # /odom/localization_odom; publishing there would change the vendor TF.
+    odom_topic: "/security_robot/localization/odom"
     init_R: [1.0, 0.0, 0.0,
              0.0, 1.0, 0.0,
              0.0, 0.0, 1.0]
