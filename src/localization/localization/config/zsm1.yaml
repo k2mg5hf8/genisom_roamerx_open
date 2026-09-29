@@ -16,6 +16,13 @@ localization:
              0.0, 1.0, 0.0, 0.0,
             -1.0, 0.0, 0.0, 0.0,
              0.0, 0.0, 0.0, 1.0]
+    # Start from the configured/operator pose. Global localization runs a
+    # synchronous whole-map ICP on every map load (seconds of blocking and a
+    # 23 m wrong seed on ZSL-1 on 2026-09-29); /initialpose re-seeds instead.
+    use_global_localization_init: false
+    # Dense map target: with the dual-LiDAR cloud every scan was accepted in
+    # the 2026-09-30 stationary A/B on ISR_vicon_20260908.
+    globalmap_voxel_size: 0.10
 
 pointcloud_self_filter:
   ros__parameters:
