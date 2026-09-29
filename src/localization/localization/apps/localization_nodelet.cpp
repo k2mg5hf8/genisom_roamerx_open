@@ -188,6 +188,13 @@ public:
       declare_parameter<double>("motor_odom_alignment_yaw_offset_deg", 0.0));
     local_odom_publish_rate_hz_ = std::max(
       1.0, declare_parameter<double>("local_odom_publish_rate_hz", 50.0));
+    // The fused odom / TF timer only reads state guarded by its own mutexes
+    // (fused prediction, IMU, map->odom). In the default callback group it
+    // shares the executor slot with points_callback, so /odom/fused_odom and
+    // /mo_tf stall for the whole NDT registration (0.2-0.7 s per scan, seconds
+    // during global localization). false restores the old behaviour for A/B.
+    local_odom_own_callback_group_ =
+      declare_parameter<bool>("local_odom_own_callback_group", true);
     tracking_min_position_stddev_ = declare_parameter<double>(
       "tracking_min_position_stddev", 0.05);
     tracking_min_orientation_stddev_deg_ = declare_parameter<double>(
@@ -434,10 +441,17 @@ public:
                 std::bind(&HdlLocalizationNode::PublishOdomTimer, this));
     pose_pub    = create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
     local_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(local_odom_topic, 20);
+    if (local_odom_own_callback_group_) {
+      local_odom_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    }
     local_odom_publish_timer_ = this->create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::duration<double>(1.0 / local_odom_publish_rate_hz_)),
-      std::bind(&HdlLocalizationNode::PublishLocalOdomTimer, this));
+      std::bind(&HdlLocalizationNode::PublishLocalOdomTimer, this),
+      local_odom_group_);
+    RCLCPP_INFO(
+      get_logger(), "Fused odom/TF timer %.0f Hz in %s callback group",
+      local_odom_publish_rate_hz_, local_odom_own_callback_group_ ? "its own" : "the default");
     aligned_pub = create_publisher<sensor_msgs::msg::PointCloud2>(aligned_points_topic, 5);
     status_pub  = create_publisher<localization::msg::ScanMatchingStatus>(status_topic, 5);
 
@@ -3852,6 +3866,8 @@ private:
   bool send_odom_base_transform_ = false;
   bool publish_bootstrap_map_to_odom_ = true;
   double local_odom_publish_rate_hz_ = 50.0;
+  bool local_odom_own_callback_group_{true};
+  rclcpp::CallbackGroup::SharedPtr local_odom_group_;
   double tracking_min_position_stddev_ = 0.05;
   double tracking_min_orientation_stddev_deg_ = 2.0;
   double initializing_position_stddev_ = 0.50;
@@ -3998,8 +4014,9 @@ int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<localization::HdlLocalizationNode>(rclcpp::NodeOptions());
 
-  // Keep LiDAR/NDT, IMU and motor odometry callbacks independently serviceable.
-  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  // Keep LiDAR/NDT, IMU, motor odometry and the fused odom/TF timer
+  // independently serviceable: one thread per callback group.
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
   executor.add_node(node);
   executor.spin();
   rclcpp::shutdown();
