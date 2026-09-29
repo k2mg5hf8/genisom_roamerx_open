@@ -13,6 +13,7 @@ def generate_launch_description():
     config_file = os.path.join(localization_dir, 'config', 'config.yaml')
     gnss_recovery_disabled_file = os.path.join(
         localization_dir, 'config', 'gnss_recovery_disabled.yaml')
+    robot_default_file = os.path.join(localization_dir, 'config', 'robot_default.yaml')
 
     # Per-robot sensor topic names. Defaults match config.yaml's points_topic/imu_topic,
     # so on the "native" robot nothing changes. On a robot with different native topic
@@ -30,10 +31,20 @@ def generate_launch_description():
         ),
     )
 
+    robot_config_arg = DeclareLaunchArgument(
+        'robot_config',
+        default_value=robot_default_file,
+        description=(
+            'Per-robot parameter overlay loaded after config.yaml, e.g. '
+            'config/zsm1.yaml. The default only repeats code defaults.'
+        ),
+    )
+
     return LaunchDescription([
         lidar_topic_arg,
         imu_topic_arg,
         gnss_recovery_config_arg,
+        robot_config_arg,
         Node(
             package='localization',
             executable='pointcloud_self_filter_node',
@@ -41,6 +52,7 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 config_file,
+                LaunchConfiguration('robot_config'),
                 {'input_topic': LaunchConfiguration('lidar_topic')},
             ],
         ),
@@ -57,7 +69,11 @@ def generate_launch_description():
             executable='localization_node',
             name='localization',
             output='screen',
-            parameters=[config_file, LaunchConfiguration('gnss_recovery_config')],
+            parameters=[
+                config_file,
+                LaunchConfiguration('gnss_recovery_config'),
+                LaunchConfiguration('robot_config'),
+            ],
             remappings=[
                 ('/front_lidar', LaunchConfiguration('lidar_topic')),
                 ('/front_lidar/imu', LaunchConfiguration('imu_topic')),

@@ -75,6 +75,9 @@ public:
     use_imu     = declare_parameter<bool>("use_imu", true);
     invert_acc  = declare_parameter<bool>("invert_acc", false);
     invert_gyro = declare_parameter<bool>("invert_gyro", false);
+    // Livox and RoboSense Airy IMUs publish acceleration in g; REP-145 IMUs
+    // (e.g. the ZSM-1 central IMU bridge) publish m/s^2 and need 1.0.
+    imu_acc_scale_ = static_cast<float>(declare_parameter<double>("imu_acc_scale", 9.81));
     // imu static init params
     imu_init_time_         = static_cast<float>(declare_parameter<double>("imu_init_time", 3.0));
     imu_init_queue_size_   = declare_parameter<int>("imu_init_queue_size", 600);
@@ -308,6 +311,7 @@ public:
                 "  use_imu: %s\n"
                 "  invert_acc: %s\n"
                 "  invert_gyro: %s\n"
+                "  imu_acc_scale: %.5f\n"
                 "  imu_topic: %s\n"
                 "  points_topic: %s\n"
                 "  odom_topic: %s\n"
@@ -337,6 +341,7 @@ public:
                 use_imu ? "true" : "false",
                 invert_acc ? "true" : "false",
                 invert_gyro ? "true" : "false",
+                static_cast<double>(imu_acc_scale_),
                 imu_topic.c_str(),
                 points_topic.c_str(),
                 odom_topic.c_str(),
@@ -1578,8 +1583,8 @@ private:
     last_received_imu_stamp_ns_ = stamp_ns;
     correct_imu_data_ptr_ = imu_msg;
     Eigen::Vector3f acceleration(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z);
-    // Apply rotation matrix and gravity compensation
-    acceleration = init_rotation_matrix_ * acceleration * 9.81;
+    // Apply rotation matrix and convert to m/s^2
+    acceleration = init_rotation_matrix_ * acceleration * imu_acc_scale_;
     correct_imu_data_ptr_->linear_acceleration.x = acceleration.x();
     correct_imu_data_ptr_->linear_acceleration.y = acceleration.y();
     correct_imu_data_ptr_->linear_acceleration.z = acceleration.z();
@@ -3980,6 +3985,7 @@ private:
   bool use_imu;
   bool invert_acc;
   bool invert_gyro;
+  float imu_acc_scale_{9.81f};
   bool enable_internal_odom_ukf_ = false;
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr                         imu_sub;

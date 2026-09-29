@@ -1,0 +1,25 @@
+# ZSM-1 (ZSIBOT M1) overlay, loaded after config.yaml via
+#   ros2 launch localization localization.launch.py robot_config:=<share>/config/zsm1.yaml
+# IMU: central FORSENSE module through security_robot_sensors/imu_central_bridge,
+# which already publishes base-aligned axes, m/s^2 and robot-clock stamps.
+localization:
+  ros__parameters:
+    imu_topic: "/security_robot/imu/central"
+    imu_acc_scale: 1.0
+    init_R: [1.0, 0.0, 0.0,
+             0.0, 1.0, 0.0,
+             0.0, 0.0, 1.0]
+    # Front Airy (rslidar_head) -> base_link from /ota/calibration_results.yaml
+    # (imu_front_to_base with lidar_front_to_imu_front = identity): the Airy
+    # axis looks forward, x of the cloud points down.
+    init_T: [0.0, 0.0, 1.0, 0.36615,
+             0.0, 1.0, 0.0, 0.0,
+            -1.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 1.0]
+
+pointcloud_self_filter:
+  ros__parameters:
+    # The Livox boxes in config.yaml cut the wrong volume in Airy axes. Until a
+    # leg/body box is measured on the standing robot, only drop returns from
+    # the sensor housing (the driver already drops < 0.2 m).
+    exclusion_boxes: [-0.15, 0.15, -0.15, 0.15, -0.15, 0.15]

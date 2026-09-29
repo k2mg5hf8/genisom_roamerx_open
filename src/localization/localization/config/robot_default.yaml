@@ -1,0 +1,5 @@
+# Default per-robot overlay: repeats code defaults so the launch always has a
+# robot_config file to load. Robot-specific files (e.g. zsm1.yaml) replace it.
+localization:
+  ros__parameters:
+    imu_acc_scale: 9.81
