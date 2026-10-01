@@ -173,6 +173,20 @@ public:
     tracking_max_xy_jump_ = static_cast<float>(declare_parameter<double>("tracking_max_xy_jump", 0.4));
     tracking_max_yaw_jump_deg_ = static_cast<float>(declare_parameter<double>("tracking_max_yaw_jump_deg", 15.0));
     reliable_threshold_ = static_cast<float>(declare_parameter<double>("tracking_max_fitness_score", 0.25));
+    reanchor_enabled_ = declare_parameter<bool>("reanchor_enabled", true);
+    reanchor_count_threshold_ = std::max(1, static_cast<int>(
+      declare_parameter<int>("reanchor_count_threshold", 10)));
+    reanchor_max_fitness_score_ = static_cast<float>(
+      declare_parameter<double>("reanchor_max_fitness_score", 0.05));
+    reanchor_fitness_ratio_ = static_cast<float>(
+      declare_parameter<double>("reanchor_fitness_ratio", 0.6));
+    reanchor_max_xy_ = static_cast<float>(declare_parameter<double>("reanchor_max_xy", 1.5));
+    reanchor_max_yaw_deg_ = static_cast<float>(
+      declare_parameter<double>("reanchor_max_yaw_deg", 20.0));
+    reanchor_max_xy_spread_ = static_cast<float>(
+      declare_parameter<double>("reanchor_max_xy_spread", 0.08));
+    reanchor_max_yaw_spread_deg_ = static_cast<float>(
+      declare_parameter<double>("reanchor_max_yaw_spread_deg", 3.0));
     planar_ndt_enabled_ = declare_parameter<bool>("planar_ndt_enabled", true);
     localization_scan_min_interval_sec_ =
       declare_parameter<double>("localization_scan_min_interval_sec", 0.18);
@@ -529,6 +543,22 @@ private:
   float reliable_threshold_ = 0.25f;
   float tracking_max_xy_jump_ = 0.4f;
   float tracking_max_yaw_jump_deg_ = 15.0f;
+  // Re-anchor: tracking keeps rejecting (jump gate) one NDT minimum that is
+  // clearly better than the tracked one. Happens after a wrong init/operator
+  // seed: the gate can never correct it and, while the robot stands still,
+  // recovery is bounded to 0.2 m, so localization stays DEGRADED forever.
+  bool reanchor_enabled_ = true;
+  int reanchor_count_threshold_ = 10;
+  float reanchor_max_fitness_score_ = 0.05f;
+  float reanchor_fitness_ratio_ = 0.6f;
+  float reanchor_max_xy_ = 1.5f;
+  float reanchor_max_yaw_deg_ = 20.0f;
+  float reanchor_max_xy_spread_ = 0.08f;
+  float reanchor_max_yaw_spread_deg_ = 3.0f;
+  int reanchor_count_ = 0;
+  Eigen::Vector2f reanchor_first_offset_ = Eigen::Vector2f::Zero();
+  float reanchor_first_yaw_deg_ = 0.0f;
+  float last_accepted_fitness_ = std::numeric_limits<float>::infinity();
   bool planar_ndt_enabled_ = true;
   double localization_scan_min_interval_sec_ = 0.18;
   double motor_twist_stale_timeout_sec_ = 0.35;
@@ -2746,6 +2776,12 @@ private:
           !std::isfinite(rejected_xy) || !std::isfinite(rejected_yaw_deg) ||
           rejected_xy > recovery_max_odom_xy_error_ ||
           rejected_yaw_deg > recovery_max_odom_yaw_error_deg_;
+        // Resets tracking (like /initialpose) when the sequence completes;
+        // the branches below then see an uninitialized estimator.
+        update_reanchor_sequence(
+          rclcpp::Time(stamp), rejection_reason, match_result.fitness_score_,
+          correction_diagnostics.candidate_pose, correction_diagnostics.innovation,
+          stateless_recovery_verification);
         const int degraded_count_threshold = severe_tracking_rejection ?
           tracking_severe_degraded_count_threshold_ :
           tracking_degraded_count_threshold_;
@@ -2776,6 +2812,10 @@ private:
         }
       } else {
         bad_match_count_ = 0;
+        reanchor_count_ = 0;
+        if (is_init_success_) {
+          last_accepted_fitness_ = match_result.fitness_score_;
+        }
         if (degraded_odom_active_ && is_init_success_) {
           degraded_odom_active_ = false;
           degraded_odom_blocked_ = false;
@@ -2857,6 +2897,59 @@ private:
     }
   }
 
+  void update_reanchor_sequence(
+    const rclcpp::Time& stamp, const std::string& rejection_reason, float fitness,
+    const Eigen::Matrix4f& candidate_pose, const Eigen::Matrix4f& innovation,
+    bool stateless_recovery_verification) {
+    const float jump_xy = innovation.block<2, 1>(0, 3).norm();
+    const float jump_yaw_deg = std::abs(std::atan2(innovation(1, 0), innovation(0, 0))) *
+      180.0f / static_cast<float>(M_PI);
+    const bool qualifies =
+      reanchor_enabled_ && is_init_success_ && !stateless_recovery_verification &&
+      (rejection_reason == "xy_jump_gate" || rejection_reason == "yaw_jump_gate") &&
+      std::isfinite(fitness) && fitness <= reanchor_max_fitness_score_ &&
+      fitness <= reanchor_fitness_ratio_ * last_accepted_fitness_ &&
+      std::isfinite(jump_xy) && jump_xy <= reanchor_max_xy_ &&
+      std::isfinite(jump_yaw_deg) && jump_yaw_deg <= reanchor_max_yaw_deg_;
+    if (!qualifies) {
+      reanchor_count_ = 0;
+      return;
+    }
+    // Offset of the candidate from the prediction in the map frame: constant
+    // for a wrong anchor whether or not the robot moves.
+    const Eigen::Matrix4f predicted = candidate_pose * innovation.inverse();
+    const Eigen::Vector2f offset =
+      candidate_pose.block<2, 1>(0, 3) - predicted.block<2, 1>(0, 3);
+    const float yaw_deg = std::atan2(innovation(1, 0), innovation(0, 0)) *
+      180.0f / static_cast<float>(M_PI);
+    const bool agrees = reanchor_count_ > 0 &&
+      (offset - reanchor_first_offset_).norm() <= reanchor_max_xy_spread_ &&
+      std::abs(yaw_deg - reanchor_first_yaw_deg_) <= reanchor_max_yaw_spread_deg_;
+    if (!agrees) {
+      reanchor_count_ = 1;
+      reanchor_first_offset_ = offset;
+      reanchor_first_yaw_deg_ = yaw_deg;
+      return;
+    }
+    if (++reanchor_count_ < reanchor_count_threshold_) return;
+
+    const Eigen::Vector3f position = candidate_pose.block<3, 1>(0, 3);
+    Eigen::Quaternionf orientation(candidate_pose.block<3, 3>(0, 0));
+    orientation.normalize();
+    RCLCPP_WARN(get_logger(),
+      "Re-anchoring to a consistently better NDT minimum: %d scans, score %.4f "
+      "(tracked %.4f), jump %.3f m %.1f deg -> pos=[%.3f, %.3f] yaw=%.1f deg; "
+      "re-verifying like an initial pose",
+      reanchor_count_, fitness, last_accepted_fitness_, jump_xy, jump_yaw_deg,
+      position.x(), position.y(), pose_yaw(candidate_pose) * 180.0f / static_cast<float>(M_PI));
+    last_init_pos_ = position;
+    last_init_quat_ = orientation;
+    has_set_init_pose_ = true;
+    last_pose_source_ = "Reanchor";
+    reset_tracking_state_locked(stamp, true, position, orientation);
+    gl_once_gate_ = false;
+  }
+
   void reset_tracking_state_locked(
     const rclcpp::Time& stamp,
     bool create_estimator,
@@ -2875,6 +2968,8 @@ private:
     localization_state_ = create_estimator ? 1 : 0;
     init_match_count_ = 0;
     bad_match_count_ = 0;
+    reanchor_count_ = 0;
+    last_accepted_fitness_ = std::numeric_limits<float>::infinity();
     recovery_count_multiplier_ = 1;
     degraded_odom_active_ = false;
     degraded_odom_blocked_ = false;
@@ -2973,7 +3068,8 @@ private:
     new_quat.normalize();
     
     bool pose_changed = false;
-    if (!has_set_init_pose_) {
+    if (!has_set_init_pose_ || localization_state_ != 3) {
+      // Not tracking: a repeated operator pose is a retry, never a no-op.
       pose_changed = true;
     } else {
       float pos_change = (new_pos - last_init_pos_).norm();

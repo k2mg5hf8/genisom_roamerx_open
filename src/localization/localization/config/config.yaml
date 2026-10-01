@@ -105,6 +105,21 @@ localization:
     tracking_max_xy_jump: 0.4
     tracking_max_yaw_jump_deg: 15.0
     tracking_max_fitness_score: 0.25
+    # Re-anchor when tracking keeps rejecting (jump gate) one NDT minimum that
+    # is clearly better than the tracked one: a wrong init or operator seed the
+    # 0.4 m gate can never correct (ZSM-1 2026-10-01: init at score 0.078,
+    # then 0.52 m rejections at 0.026 forever while standing). Requires
+    # reanchor_count_threshold consecutive agreeing scans; the candidate then
+    # goes through the normal initial-pose verification. In normal tracking the
+    # tracked score is already good, so the ratio test keeps this inactive.
+    reanchor_enabled: true
+    reanchor_count_threshold: 10
+    reanchor_max_fitness_score: 0.05
+    reanchor_fitness_ratio: 0.6
+    reanchor_max_xy: 1.5
+    reanchor_max_yaw_deg: 20.0
+    reanchor_max_xy_spread: 0.08
+    reanchor_max_yaw_spread_deg: 3.0
     # Ground robot: NDT and the UKF operate in x/y/yaw. The configured initial
     # z/roll/pitch stay fixed instead of following Livox mounting tilt.
     planar_ndt_enabled: true
