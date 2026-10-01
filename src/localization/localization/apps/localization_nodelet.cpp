@@ -2313,18 +2313,12 @@ private:
       RCLCPP_INFO(get_logger(), "Attempting global localization for better initial pose...");
       if (performGlobalLocalization(raw_points_ptr_)) {
         RCLCPP_INFO(get_logger(), "Global localization successful! Using new initial pose.");
-        pose_estimator.reset(new localization::PoseEstimator(
-          registration, get_clock()->now(), last_init_pos_, last_init_quat_, cool_time_duration));
-        set_initial_correction_limits();
-        mark_pose_estimator_recreated();
-        last_odom_prediction_stamp_ns_ = 0;
-        is_init_success_ = false;
-        init_match_count_ = 0;
-        recovery_verification_active_ = false;
-        recovery_verification_from_gnss_ = false;
-        has_recovery_verification_anchor_ = false;
-        has_recovery_verification_offset_ = false;
-        localization_state_ = 1;
+        // Seed exactly like /initialpose: full tracking reset, including the
+        // IMU queue. The partial reset kept the IMU samples queued during the
+        // synchronous search (future_queue ~270) and the first prediction
+        // integrated them at once; the attitude diverged before init (ZSL-1W
+        // 2026-10-02: NDT score 0.78 -> 13 within 2 s, status 1 forever).
+        reset_tracking_state_locked(get_clock()->now(), true, last_init_pos_, last_init_quat_);
         gl_once_gate_ = false;
         RCLCPP_INFO(get_logger(), "Pose estimator recreated with global localization result");
       } else {
