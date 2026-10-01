@@ -1254,6 +1254,41 @@ private:
       gyro_bias.x(), gyro_bias.y(), gyro_bias.z());
   }
 
+  // A global-localization seed keeps x, y and yaw only; z, roll and pitch come
+  // from the planar reference the cached static IMU bias was derived against
+  // (as for /initialpose and recovery). Otherwise a robot standing on a slope
+  // gets its tilt counted twice: once in the acc bias (measured against the
+  // level config pose) and once in the seeded attitude. The UKF attitude then
+  // diverges before init completes (ZSL-1W 2026-10-01, ~4.2 deg slope: acc
+  // bias x -0.73 m/s^2, NDT score 0.46 -> 4.8 within 2 s, init never passed).
+  void project_to_planar_reference(Eigen::Vector3f& position, Eigen::Quaternionf& orientation) {
+    if (!planar_ndt_enabled_) return;
+    float z, roll, pitch;
+    {
+      std::lock_guard<std::mutex> imu_lock(imu_data_mutex);
+      if (!has_cached_imu_biases_) return;  // the cache will use this attitude
+      z = stationary_reference_z_;
+      roll = stationary_reference_roll_;
+      pitch = stationary_reference_pitch_;
+    }
+    const Eigen::Matrix3f rotation = orientation.toRotationMatrix();
+    const float yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+    const float seed_pitch = std::asin(std::clamp(-rotation(2, 0), -1.0f, 1.0f));
+    const float seed_roll = std::atan2(rotation(2, 1), rotation(2, 2));
+    RCLCPP_INFO(get_logger(),
+      "Global localization seed projected to the planar reference: z %.3f -> %.3f m, "
+      "roll %.2f -> %.2f deg, pitch %.2f -> %.2f deg",
+      position.z(), z, seed_roll * 180.0f / static_cast<float>(M_PI),
+      roll * 180.0f / static_cast<float>(M_PI), seed_pitch * 180.0f / static_cast<float>(M_PI),
+      pitch * 180.0f / static_cast<float>(M_PI));
+    position.z() = z;
+    orientation = Eigen::Quaternionf(
+      Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()) *
+      Eigen::AngleAxisf(pitch, Eigen::Vector3f::UnitY()) *
+      Eigen::AngleAxisf(roll, Eigen::Vector3f::UnitX()));
+    orientation.normalize();
+  }
+
   void mark_pose_estimator_recreated() {
     imu_bias_applied_to_estimator_ = false;
     apply_static_imu_biases_to_estimator();
@@ -3104,6 +3139,8 @@ private:
       if (localization_success) {
         Eigen::Vector3f new_pos = final_pose.block<3, 1>(0, 3).cast<float>();
         Eigen::Quaternionf new_quat(final_pose.block<3, 3>(0, 0).cast<float>());
+        new_quat.normalize();
+        project_to_planar_reference(new_pos, new_quat);
         if (pose_estimator) {
           last_init_pos_ = new_pos;
           last_init_quat_ = new_quat;
