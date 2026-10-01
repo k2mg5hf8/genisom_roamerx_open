@@ -2904,8 +2904,11 @@ private:
     const float jump_xy = innovation.block<2, 1>(0, 3).norm();
     const float jump_yaw_deg = std::abs(std::atan2(innovation(1, 0), innovation(0, 0))) *
       180.0f / static_cast<float>(M_PI);
+    // Recovery-verification scans run with their own (stationary 0.2 m)
+    // limits and interleave with tracking: neither count nor break the sequence.
+    if (stateless_recovery_verification) return;
     const bool qualifies =
-      reanchor_enabled_ && is_init_success_ && !stateless_recovery_verification &&
+      reanchor_enabled_ && is_init_success_ &&
       (rejection_reason == "xy_jump_gate" || rejection_reason == "yaw_jump_gate") &&
       std::isfinite(fitness) && fitness <= reanchor_max_fitness_score_ &&
       fitness <= reanchor_fitness_ratio_ * last_accepted_fitness_ &&
