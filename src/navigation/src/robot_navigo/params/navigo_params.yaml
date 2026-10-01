@@ -348,7 +348,7 @@ velocity_optimizer:
     scale_velocities: false
     feedback: "OPEN_LOOP"
     max_velocity: [1.0, 0.2, 0.5] #[3.0, 2.0, 1.0]
-    min_velocity: [-0.35, -0.10, -0.35] #[-3.0, -2.0, -3.0]
+    min_velocity: [-0.35, -0.10, -0.50] # yaw symmetric with max (was -0.35: right turns slower) #[-3.0, -2.0, -3.0]
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
     max_accel: [1.5, 1.0, 1.5]

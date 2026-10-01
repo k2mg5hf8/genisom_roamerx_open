@@ -86,9 +86,13 @@ localization:
 
     # initial pose initialization parameters 
     init_match_count_threshold: 2         
-    # Reject one transient NDT outlier without stopping navigation. Two
+    # Ride through short NDT outlier streaks on the fused prediction (50 Hz
+    # since the odometry callback-group fix) instead of stopping navigation.
+    # ZSL-1W 2026-10-02 route bag: all 8 route DEGRADED dips (each a 3-4 s
+    # stop + relocalization branch) were 2-3 marginal fitness rejections
+    # (score 0.25-0.43, correction <= 0.36 m); with 4 only 1 remains. Four
     # consecutive failures enter DEGRADED_ODOM; six mark persistent loss.
-    tracking_degraded_count_threshold: 2
+    tracking_degraded_count_threshold: 4
     bad_match_count_threshold: 6
     init_match_score_threshold: 0.15      
     # Field bags show otherwise good NDT corrections first crossing the gate at
