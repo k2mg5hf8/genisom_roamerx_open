@@ -32,7 +32,7 @@ localization:
 
     # registration method parameters
     reg_method: "NDT_OMP"
-    ndt_neighbor_search_method: "DIRECT7"
+    ndt_neighbor_search_method: "KDTREE"
     ndt_neighbor_search_radius: 1.0
     ndt_resolution: 0.5
 

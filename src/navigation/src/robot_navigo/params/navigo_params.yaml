@@ -129,7 +129,7 @@ local_costmap:
         observation_persistence: 0.0
         observation_sources: lidar
         lidar:
-          topic: /front_lidar
+          topic: /livox/lidar
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -231,10 +231,10 @@ controller_server:
       vx_std: 0.2
       vy_std: 0.0
       wz_std: 0.4
-      vx_max: 1.5 #0.5
-      vx_min: -1.5 #-0.35
+      vx_max: 0.35 # EchoDiffusion first-test limit
+      vx_min: -0.35 # symmetric EchoDiffusion first-test limit
       vy_max: 0.1 #0.5
-      wz_max: 1.2
+      wz_max: 0.5 # EchoDiffusion first-test limit
       ax_max: 2.0
       ay_max: 2.0
       ax_min: -2.0

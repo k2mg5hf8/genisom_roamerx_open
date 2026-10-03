@@ -44,7 +44,7 @@ collision_monitor:
     observation_sources: ["lidar"]
     lidar:
       type: "pointcloud"
-      topic: "/front_lidar"
+      topic: /livox/lidar
       min_height: 0.05
       max_height: 2.0
       enabled: True
