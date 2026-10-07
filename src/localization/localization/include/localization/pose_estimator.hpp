@@ -43,13 +43,41 @@ public:
     float fitness_score_ = std::numeric_limits<float>::infinity();  ///< The fitness score of the matching operation.
   };
 
+  // Scan-to-map agreement of the NDT result, one nearest-neighbour pass over
+  // the aligned scan against the registration's target kd-tree.
+  struct ScanMetrics {
+    bool valid = false;
+    uint32_t points = 0;
+    // PCL getFitnessScore(): mean squared NN distance over all points.
+    float mean_sq = std::numeric_limits<float>::infinity();
+    // mean(min(d^2, tau^2)): people, cars, vegetation and returns beyond the
+    // map edge cost at most tau^2 each instead of their full squared distance.
+    float capped_sq = std::numeric_limits<float>::infinity();
+    float inlier_fraction = 0.0f;  // share of points with d <= tau
+    float inlier_rmse = std::numeric_limits<float>::infinity();
+  };
+
+  enum class FitnessMetric { kMeanSquared, kCappedSquared };
+
   struct CorrectionDiagnostics {
     bool accepted = false;
     std::string rejection_reason = "not_run";
     Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f candidate_pose = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f innovation = Eigen::Matrix4f::Identity();
+    // Guess actually handed to NDT (initial_guess plus the terrain hint) and
+    // the unprojected 6-DoF NDT result.
+    Eigen::Matrix4f registration_guess = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f raw_transform = Eigen::Matrix4f::Identity();
+    bool has_raw_transform = false;
+    int iterations = -1;
+    ScanMetrics metrics;
   };
+
+  static ScanMetrics compute_scan_metrics(
+    const pcl::PointCloud<PointT>& aligned,
+    const pcl::Registration<PointT, PointT>& registration,
+    float inlier_distance);
 
   /**
    * @brief constructor
@@ -133,8 +161,31 @@ public:
     max_yaw_jump_ = max_yaw_jump;
     max_fitness_score_ = max_fitness_score;
   }
+  // Which ScanMetrics value is the fitness compared with every score threshold.
+  void set_fitness_metric(FitnessMetric metric, float inlier_distance) {
+    fitness_metric_ = metric;
+    inlier_distance_ = inlier_distance;
+  }
+  // 0 disables; otherwise a correction also needs this share of inliers.
+  void set_min_inlier_fraction(float value) { min_inlier_fraction_ = value; }
+  // Terrain hint for the next correct(): the NDT initial guess takes this z,
+  // roll and pitch instead of the planar ones. The planar projection of the
+  // result (published pose, gates, UKF) is unchanged.
+  void set_registration_hint(bool valid, float z, float roll, float pitch) {
+    hint_valid_ = valid;
+    hint_z_ = z;
+    hint_roll_ = roll;
+    hint_pitch_ = pitch;
+  }
 
 private:
+  FitnessMetric fitness_metric_ = FitnessMetric::kMeanSquared;
+  float inlier_distance_ = 0.5f;
+  float min_inlier_fraction_ = 0.0f;
+  bool hint_valid_ = false;
+  float hint_z_ = 0.0f;
+  float hint_roll_ = 0.0f;
+  float hint_pitch_ = 0.0f;
   float max_xy_jump_ = 5.0f;
   bool planar_correction_enabled_ = true;
   float max_yaw_jump_ = std::numeric_limits<float>::infinity();

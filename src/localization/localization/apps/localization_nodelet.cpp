@@ -187,7 +187,45 @@ public:
       declare_parameter<double>("reanchor_max_xy_spread", 0.08));
     reanchor_max_yaw_spread_deg_ = static_cast<float>(
       declare_parameter<double>("reanchor_max_yaw_spread_deg", 3.0));
+    // false: any other scan breaks a re-anchor sequence (vendor behaviour).
+    // true: only evidence for the tracked pose breaks it - an accepted scan as
+    // good as the sequence candidates, or a jump-gate candidate that does not
+    // qualify. Mediocre accepted scans from a wrong minimum and unrelated
+    // rejections (diverged NDT, map gates) neither count nor break it.
+    reanchor_tolerant_sequence_ =
+      declare_parameter<bool>("reanchor_tolerant_sequence", false);
     planar_ndt_enabled_ = declare_parameter<bool>("planar_ndt_enabled", true);
+    // Terrain hint: NDT starts from the z/roll/pitch found by the previous
+    // accepted scans instead of the start point's (planar reference). The
+    // published pose, the UKF and the costmap frame stay planar.
+    ndt_terrain_guess_enabled_ =
+      declare_parameter<bool>("ndt_terrain_guess_enabled", false);
+    ndt_terrain_max_dz_step_ = static_cast<float>(
+      declare_parameter<double>("ndt_terrain_max_dz_step", 0.15));
+    ndt_terrain_max_tilt_step_deg_ = static_cast<float>(
+      declare_parameter<double>("ndt_terrain_max_tilt_step_deg", 2.0));
+    ndt_terrain_max_tilt_deg_ = static_cast<float>(
+      declare_parameter<double>("ndt_terrain_max_tilt_deg", 12.0));
+    // Fitness compared with every score threshold: "mean_sq" (PCL fitness,
+    // vendor default) or "capped_sq" (squared NN distance capped at
+    // fitness_inlier_distance^2, robust to people/cars/vegetation/off-map).
+    fitness_metric_name_ = declare_parameter<std::string>("fitness_metric", "mean_sq");
+    if (fitness_metric_name_ == "capped_sq") {
+      fitness_metric_ = PoseEstimator::FitnessMetric::kCappedSquared;
+    } else {
+      if (fitness_metric_name_ != "mean_sq") {
+        RCLCPP_WARN(get_logger(), "Unknown fitness_metric '%s', using mean_sq",
+          fitness_metric_name_.c_str());
+        fitness_metric_name_ = "mean_sq";
+      }
+      fitness_metric_ = PoseEstimator::FitnessMetric::kMeanSquared;
+    }
+    fitness_inlier_distance_ = static_cast<float>(std::max(
+      0.05, declare_parameter<double>("fitness_inlier_distance", 0.5)));
+    min_inlier_fraction_ = static_cast<float>(
+      declare_parameter<double>("min_inlier_fraction", 0.0));
+    tracking_severe_min_inlier_fraction_ = static_cast<float>(
+      declare_parameter<double>("tracking_severe_min_inlier_fraction", 0.0));
     localization_scan_min_interval_sec_ =
       declare_parameter<double>("localization_scan_min_interval_sec", 0.18);
     motor_twist_stale_timeout_sec_ =
@@ -307,6 +345,17 @@ public:
     
     declare_parameter<float>("global_localization_timeout", 10.0);
     get_parameter("global_localization_timeout", global_localization_timeout_);
+    // Background recovery search after a tracking loss. It used to exist only
+    // together with use_global_localization_init (the start-up whole-map
+    // search); this enables it on its own. A positive crop radius builds the
+    // search target from the map around the degraded pose, not the whole map.
+    recovery_search_enabled_ = declare_parameter<bool>("recovery_search_enabled", false);
+    recovery_map_crop_radius_ = declare_parameter<double>("recovery_map_crop_radius", 0.0);
+    // Initialization guess = seed (operator pose, re-anchor, map load) moved by
+    // the fused odometry since the seed, like recovery verification. Without
+    // it the guess is the IMU-only UKF, which drifts within seconds while the
+    // robot walks, so initialization could only succeed at a standstill.
+    init_odom_anchor_enabled_ = declare_parameter<bool>("init_odom_anchor_enabled", false);
 
     static_imu_init_.SetParam(imu_init_time_, imu_init_queue_size_, imu_init_max_gyro_var_, imu_init_max_acce_var_);
     
@@ -556,10 +605,31 @@ private:
   float reanchor_max_xy_spread_ = 0.08f;
   float reanchor_max_yaw_spread_deg_ = 3.0f;
   int reanchor_count_ = 0;
+  bool reanchor_tolerant_sequence_ = false;
+  float reanchor_sequence_fitness_ = 0.0f;  // worst candidate fitness in the sequence
   Eigen::Vector2f reanchor_first_offset_ = Eigen::Vector2f::Zero();
   float reanchor_first_yaw_deg_ = 0.0f;
   float last_accepted_fitness_ = std::numeric_limits<float>::infinity();
   bool planar_ndt_enabled_ = true;
+  bool ndt_terrain_guess_enabled_ = false;
+  float ndt_terrain_max_dz_step_ = 0.15f;
+  float ndt_terrain_max_tilt_step_deg_ = 2.0f;
+  float ndt_terrain_max_tilt_deg_ = 12.0f;
+  bool has_terrain_hint_ = false;
+  float terrain_z_ = 0.0f;
+  float terrain_roll_ = 0.0f;
+  float terrain_pitch_ = 0.0f;
+  std::string fitness_metric_name_ = "mean_sq";
+  PoseEstimator::FitnessMetric fitness_metric_ = PoseEstimator::FitnessMetric::kMeanSquared;
+  float fitness_inlier_distance_ = 0.5f;
+  float min_inlier_fraction_ = 0.0f;
+  float tracking_severe_min_inlier_fraction_ = 0.0f;
+  bool recovery_search_enabled_ = false;
+  double recovery_map_crop_radius_ = 0.0;
+  bool init_odom_anchor_enabled_ = false;
+  bool has_init_odom_anchor_ = false;
+  Eigen::Matrix4f init_anchor_map_pose_{Eigen::Matrix4f::Identity()};
+  Eigen::Matrix4f init_anchor_odom_pose_{Eigen::Matrix4f::Identity()};
   double localization_scan_min_interval_sec_ = 0.18;
   double motor_twist_stale_timeout_sec_ = 0.35;
   float motor_twist_filter_alpha_ = 0.25f;
@@ -1154,7 +1224,42 @@ private:
     return transition_is_map_safe(previous, candidate_pose);
   }
 
+  void configure_pose_estimator_scoring() {
+    if (!pose_estimator) return;
+    pose_estimator->set_fitness_metric(fitness_metric_, fitness_inlier_distance_);
+    pose_estimator->set_min_inlier_fraction(min_inlier_fraction_);
+  }
+
+  // After an accepted, committed correction: remember where 6-DoF NDT put
+  // z/roll/pitch, so the next scan starts there. Tracking limits the change
+  // per scan; during initialization the NDT values are taken as they are.
+  void update_terrain_hint(const Eigen::Matrix4f& raw, bool limit_steps) {
+    if (!ndt_terrain_guess_enabled_ || !raw.allFinite()) return;
+    const Eigen::Matrix3f rotation = raw.block<3, 3>(0, 0);
+    const float roll = std::atan2(rotation(2, 1), rotation(2, 2));
+    const float pitch = std::asin(std::clamp(-rotation(2, 0), -1.0f, 1.0f));
+    const float z = raw(2, 3);
+    if (!std::isfinite(roll) || !std::isfinite(pitch) || !std::isfinite(z)) return;
+    const float deg = static_cast<float>(M_PI) / 180.0f;
+    const float max_tilt = ndt_terrain_max_tilt_deg_ * deg;
+    float next_roll = std::clamp(roll, -max_tilt, max_tilt);
+    float next_pitch = std::clamp(pitch, -max_tilt, max_tilt);
+    float next_z = z;
+    if (has_terrain_hint_ && limit_steps) {
+      const float tilt_step = ndt_terrain_max_tilt_step_deg_ * deg;
+      next_roll = std::clamp(next_roll, terrain_roll_ - tilt_step, terrain_roll_ + tilt_step);
+      next_pitch = std::clamp(next_pitch, terrain_pitch_ - tilt_step, terrain_pitch_ + tilt_step);
+      next_z = std::clamp(next_z, terrain_z_ - ndt_terrain_max_dz_step_,
+                          terrain_z_ + ndt_terrain_max_dz_step_);
+    }
+    terrain_z_ = next_z;
+    terrain_roll_ = next_roll;
+    terrain_pitch_ = next_pitch;
+    has_terrain_hint_ = true;
+  }
+
   void set_initial_correction_limits() {
+    configure_pose_estimator_scoring();
     if (pose_estimator) {
       pose_estimator->set_planar_correction(planar_ndt_enabled_);
       pose_estimator->set_correction_limits(
@@ -1165,6 +1270,7 @@ private:
   }
 
   void set_recovery_verification_correction_limits() {
+    configure_pose_estimator_scoring();
     if (pose_estimator) {
       pose_estimator->set_planar_correction(planar_ndt_enabled_);
       const bool local_tracking = recovery_verification_from_local_tracking_;
@@ -1211,8 +1317,8 @@ private:
     voxel_filter_ptr_->setLeafSize(points_voxel_filter_size_, points_voxel_filter_size_, points_voxel_filter_size_);
     registration = create_registration(main_ndt_num_threads_);
 
-    // Initialize global localization
-    if (use_global_localization_init_) {
+    // Initialize global localization (start-up search and/or recovery search)
+    if (use_global_localization_init_ || recovery_search_enabled_) {
       try {
         global_localization_ptr_ = std::make_shared<GlobalLocalization>();
         RCLCPP_INFO(get_logger(), "Global localization initialized successfully");
@@ -1306,6 +1412,7 @@ private:
   }
 
   void mark_pose_estimator_recreated() {
+    configure_pose_estimator_scoring();
     imu_bias_applied_to_estimator_ = false;
     apply_static_imu_biases_to_estimator();
   }
@@ -1747,6 +1854,9 @@ private:
     } else if (has_reliable_pose_ && has_reliable_odom_pose_) {
       anchor_map_pose = last_reliable_pose_;
       anchor_odom_pose = last_reliable_odom_pose_;
+    } else if (init_odom_anchor_enabled_ && !is_init_success_ && has_init_odom_anchor_) {
+      anchor_map_pose = init_anchor_map_pose_;
+      anchor_odom_pose = init_anchor_odom_pose_;
     } else {
       return false;
     }
@@ -2142,6 +2252,14 @@ private:
     const float planar_z = stationary_reference_z_;
     const float planar_roll = stationary_reference_roll_;
     const float planar_pitch = stationary_reference_pitch_;
+    const bool terrain_hint = ndt_terrain_guess_enabled_ && has_terrain_hint_;
+    const float hint_z = terrain_z_;
+    const float hint_roll = terrain_roll_;
+    const float hint_pitch = terrain_pitch_;
+    const double crop_radius = recovery_map_crop_radius_;
+    const PoseEstimator::FitnessMetric fitness_metric = fitness_metric_;
+    const float inlier_distance = fitness_inlier_distance_;
+    const float min_inlier_fraction = min_inlier_fraction_;
     Eigen::Matrix4f source_odom_pose;
     if (!lookup_odom_pose(source_stamp, source_odom_pose)) {
       RCLCPP_WARN_THROTTLE(
@@ -2159,14 +2277,33 @@ private:
     recovery_future_ = std::async(std::launch::async,
       [this, cloud_copy, map, expected_pose, max_xy, max_yaw, max_score,
        planar_z, planar_roll, planar_pitch, source_odom_pose, source_stamp_ns,
-       recovery_episode_id, gnss_seed]() {
+       recovery_episode_id, gnss_seed, terrain_hint, hint_z, hint_roll, hint_pitch,
+       crop_radius, fitness_metric, inlier_distance, min_inlier_fraction]() {
         auto recovery_registration = create_registration(recovery_ndt_num_threads_);
         RecoveryResult unavailable;
         unavailable.episode_id = recovery_episode_id;
         unavailable.source_odom_pose = source_odom_pose;
         unavailable.source_stamp_ns = source_stamp_ns;
         if (!recovery_registration) return unavailable;
-        recovery_registration->setInputTarget(map);
+        // Building the NDT target over the whole map costs seconds and doubles
+        // its memory on a campus map; candidates stay within a few metres of
+        // the seeds, so the map around the degraded pose is enough. A GNSS
+        // seed may lie farther away: it gets the whole map.
+        pcl::PointCloud<PointT>::Ptr target = map;
+        if (crop_radius > 0.0 && !gnss_seed.valid) {
+          pcl::PointCloud<PointT>::Ptr cropped(new pcl::PointCloud<PointT>());
+          const float cx = expected_pose(0, 3);
+          const float cy = expected_pose(1, 3);
+          const float r_sq = static_cast<float>(crop_radius * crop_radius);
+          cropped->reserve(map->size() / 4);
+          for (const auto& point : map->points) {
+            const float dx = point.x - cx;
+            const float dy = point.y - cy;
+            if (dx * dx + dy * dy <= r_sq) cropped->push_back(point);
+          }
+          if (cropped->size() >= 1000) target = cropped;
+        }
+        recovery_registration->setInputTarget(target);
         recovery_registration->setInputSource(cloud_copy);
 
         const auto evaluate_seed =
@@ -2186,9 +2323,25 @@ private:
                 seed_pose.cast<double>(), candidate_translation_scale);
             for (const auto& candidate : candidates) {
               pcl::PointCloud<PointT> aligned;
-              recovery_registration->align(aligned, candidate.cast<float>());
+              Eigen::Matrix4f guess = candidate.cast<float>();
+              if (terrain_hint) {
+                guess.block<3, 3>(0, 0) = (
+                  Eigen::AngleAxisf(pose_yaw(guess), Eigen::Vector3f::UnitZ()) *
+                  Eigen::AngleAxisf(hint_pitch, Eigen::Vector3f::UnitY()) *
+                  Eigen::AngleAxisf(hint_roll, Eigen::Vector3f::UnitX())).toRotationMatrix();
+                guess(2, 3) = hint_z;
+              }
+              recovery_registration->align(aligned, guess);
               if (!recovery_registration->hasConverged()) continue;
-              const double score = recovery_registration->getFitnessScore();
+              const PoseEstimator::ScanMetrics metrics =
+                PoseEstimator::compute_scan_metrics(
+                  aligned, *recovery_registration, inlier_distance);
+              const double score = !metrics.valid ?
+                recovery_registration->getFitnessScore() :
+                (fitness_metric == PoseEstimator::FitnessMetric::kCappedSquared ?
+                  metrics.capped_sq : metrics.mean_sq);
+              const bool enough_inliers = min_inlier_fraction <= 0.0f ||
+                (metrics.valid && metrics.inlier_fraction >= min_inlier_fraction);
               const Eigen::Matrix4f pose = project_planar_pose(
                 recovery_registration->getFinalTransformation(),
                 planar_z, planar_roll, planar_pitch);
@@ -2204,7 +2357,7 @@ private:
               }
               const bool transition_safe = from_gnss ||
                 transition_is_map_safe(seed_pose, pose);
-              if (score > max_score ||
+              if (score > max_score || !enough_inliers ||
                   !poses_agree(pose, seed_pose, seed_max_xy, seed_max_yaw_deg) ||
                   !pose_is_map_safe(pose) || !transition_safe) {
                 continue;
@@ -2639,6 +2792,9 @@ private:
       };
 
     const bool stateless_recovery_verification = recovery_verification_active_;
+    const bool terrain_hint_used = ndt_terrain_guess_enabled_ && has_terrain_hint_;
+    pose_estimator->set_registration_hint(
+      terrain_hint_used, terrain_z_, terrain_roll_, terrain_pitch_);
     auto aligned = pose_estimator->correct(
       stamp, raw_points_ptr_, correction_validator,
       has_deterministic_initial_guess ? &deterministic_initial_guess : nullptr,
@@ -2649,7 +2805,15 @@ private:
       bool match_accepted =
         match_result.is_converged_ &&
         match_result.fitness_score_ < acceptance_score_threshold;
-      const auto correction_diagnostics = pose_estimator->correction_diagnostics();
+      auto correction_diagnostics = pose_estimator->correction_diagnostics();
+      if (const auto* ndt = dynamic_cast<const pclomp::NormalDistributionsTransform<PointT, PointT>*>(
+            registration.get())) {
+        correction_diagnostics.iterations = ndt->getFinalNumIteration();
+      }
+      if (match_accepted && !stateless_recovery_verification &&
+          correction_diagnostics.has_raw_transform) {
+        update_terrain_hint(correction_diagnostics.raw_transform, is_init_success_);
+      }
       std::string rejection_reason = correction_diagnostics.rejection_reason;
       if (rejection_reason == "external_gate" && !candidate_rejection_reason.empty()) {
         rejection_reason = candidate_rejection_reason;
@@ -2662,7 +2826,7 @@ private:
       };
       publish_scan_matching_status(
         points_msg->header, aligned, correction_diagnostics, match_accepted,
-        rejection_reason, input_point_count, filtered_point_count,
+        rejection_reason, terrain_hint_used, input_point_count, filtered_point_count,
         deskew_applied, deskewed_point_count, scan_duration_sec,
         elapsed_ms(start, t_downsample), elapsed_ms(t_downsample, t_predict),
         elapsed_ms(t_predict, t_correct), elapsed_ms(start, t_correct));
@@ -2674,6 +2838,14 @@ private:
           if (recovery_verification_active_ && has_candidate_recovery_offset) {
             recovery_verification_offset_ = candidate_recovery_offset;
             has_recovery_verification_offset_ = true;
+          }
+          Eigen::Matrix4f accepted_odom_pose;
+          if (init_odom_anchor_enabled_ && !recovery_verification_active_ &&
+              lookup_odom_pose(rclcpp::Time(stamp), accepted_odom_pose)) {
+            // The next initialization scan starts from this NDT result.
+            init_anchor_map_pose_ = correction_diagnostics.candidate_pose;
+            init_anchor_odom_pose_ = accepted_odom_pose;
+            has_init_odom_anchor_ = true;
           }
           RCLCPP_INFO(get_logger(), "Init match count: %d/%d (score: %.6f)",
                       init_match_count_, required_matches, match_result.fitness_score_);
@@ -2769,8 +2941,14 @@ private:
           rejection_reason == "non_finite_filter_update" ||
           rejection_reason == "occupancy_pose_gate" ||
           rejection_reason == "occupancy_transition_gate";
+        // Lost overlap: even at the NDT optimum few scan points lie near the map.
+        const bool inlier_collapse =
+          tracking_severe_min_inlier_fraction_ > 0.0f &&
+          correction_diagnostics.metrics.valid &&
+          correction_diagnostics.metrics.inlier_fraction <
+            tracking_severe_min_inlier_fraction_;
         const bool severe_tracking_rejection =
-          invalid_or_unsafe_rejection ||
+          invalid_or_unsafe_rejection || inlier_collapse ||
           !std::isfinite(match_result.fitness_score_) ||
           match_result.fitness_score_ >= tracking_severe_fitness_score_ ||
           !std::isfinite(rejected_xy) || !std::isfinite(rejected_yaw_deg) ||
@@ -2812,7 +2990,13 @@ private:
         }
       } else {
         bad_match_count_ = 0;
-        reanchor_count_ = 0;
+        // A tolerant sequence survives accepted scans clearly worse than its
+        // candidates (tracking held in a worse minimum by the jump gate).
+        if (!reanchor_tolerant_sequence_ || reanchor_count_ == 0 ||
+            match_result.fitness_score_ * reanchor_fitness_ratio_ <=
+              reanchor_sequence_fitness_) {
+          reanchor_count_ = 0;
+        }
         if (is_init_success_) {
           last_accepted_fitness_ = match_result.fitness_score_;
         }
@@ -2915,7 +3099,11 @@ private:
       std::isfinite(jump_xy) && jump_xy <= reanchor_max_xy_ &&
       std::isfinite(jump_yaw_deg) && jump_yaw_deg <= reanchor_max_yaw_deg_;
     if (!qualifies) {
-      reanchor_count_ = 0;
+      const bool jump_gate_candidate =
+        rejection_reason == "xy_jump_gate" || rejection_reason == "yaw_jump_gate";
+      if (!reanchor_tolerant_sequence_ || jump_gate_candidate) {
+        reanchor_count_ = 0;
+      }
       return;
     }
     // Offset of the candidate from the prediction in the map frame: constant
@@ -2932,8 +3120,10 @@ private:
       reanchor_count_ = 1;
       reanchor_first_offset_ = offset;
       reanchor_first_yaw_deg_ = yaw_deg;
+      reanchor_sequence_fitness_ = fitness;
       return;
     }
+    reanchor_sequence_fitness_ = std::max(reanchor_sequence_fitness_, fitness);
     if (++reanchor_count_ < reanchor_count_threshold_) return;
 
     const Eigen::Vector3f position = candidate_pose.block<3, 1>(0, 3);
@@ -3016,6 +3206,7 @@ private:
     global_localization_in_progress_ = false;
 
     Eigen::Matrix4f bootstrap_map_to_odom = Eigen::Matrix4f::Identity();
+    has_init_odom_anchor_ = false;
     if (create_estimator) {
       Eigen::Matrix4f initial_map_pose = Eigen::Matrix4f::Identity();
       initial_map_pose.block<3, 3>(0, 0) = initial_orientation.toRotationMatrix();
@@ -3024,6 +3215,9 @@ private:
       Eigen::Matrix4f current_odom_pose;
       if (lookup_odom_pose(stamp, current_odom_pose)) {
         bootstrap_map_to_odom = initial_map_pose * current_odom_pose.inverse();
+        init_anchor_map_pose_ = initial_map_pose;
+        init_anchor_odom_pose_ = current_odom_pose;
+        has_init_odom_anchor_ = true;
       } else {
         // Before the first fused-odometry sample, odom -> base_link is identity.
         bootstrap_map_to_odom = initial_map_pose;
@@ -3088,6 +3282,9 @@ private:
       last_init_quat_ = new_quat;
       has_set_init_pose_ = true;
       last_pose_source_ = "Callback";
+      // The operator may place the robot anywhere: terrain from the old place
+      // does not apply (a re-anchor keeps it, it happens in place).
+      has_terrain_hint_ = false;
       reset_tracking_state_locked(
         get_clock()->now(), true, last_init_pos_, last_init_quat_);
       // A manually supplied pose is the bounded search seed for this round.
@@ -3732,6 +3929,7 @@ private:
       const PoseEstimator::CorrectionDiagnostics& diagnostics,
       bool accepted,
       const std::string& rejection_reason,
+      bool terrain_hint_used,
       size_t input_points,
       size_t filtered_points,
       bool deskew_applied,
@@ -3746,29 +3944,26 @@ private:
     status.has_converged = registration->hasConverged();
     status.accepted = accepted;
     status.rejection_reason = accepted ? "" : rejection_reason;
-    status.matching_error = static_cast<float>(registration->getFitnessScore());
-    const double max_correspondence_dist = 0.5;
-
-    size_t num_inliers = 0;
-    size_t checked_points = 0;
-    std::vector<int> k_indices;
-    std::vector<float> k_sq_dists;
-    constexpr size_t max_overlap_samples = 512;
-    if (aligned && !aligned->empty() && registration->getSearchMethodTarget()) {
-      const size_t stride = std::max<size_t>(1, aligned->size() / max_overlap_samples);
-      for (size_t i = 0; i < aligned->size(); i += stride) {
-        const auto& pt = aligned->at(i);
-        if (registration->getSearchMethodTarget()->nearestKSearch(
-              pt, 1, k_indices, k_sq_dists) > 0 &&
-            !k_sq_dists.empty() &&
-            k_sq_dists[0] < max_correspondence_dist * max_correspondence_dist) {
-          ++num_inliers;
-        }
-        ++checked_points;
-      }
-    }
-    status.inlier_fraction = checked_points == 0 ? 0.0f :
-      static_cast<float>(num_inliers) / static_cast<float>(checked_points);
+    // Metrics of the NDT result itself (computed in PoseEstimator::correct);
+    // `aligned` of a rejected scan is placed at the guess, not the result.
+    (void)aligned;
+    const auto& metrics = diagnostics.metrics;
+    status.fitness_metric = fitness_metric_name_;
+    status.matching_error = !metrics.valid ? std::numeric_limits<float>::infinity() :
+      (fitness_metric_ == PoseEstimator::FitnessMetric::kCappedSquared ?
+        metrics.capped_sq : metrics.mean_sq);
+    status.mean_sq_error = metrics.mean_sq;
+    status.capped_sq_error = metrics.capped_sq;
+    status.inlier_distance = fitness_inlier_distance_;
+    status.inlier_fraction = metrics.inlier_fraction;
+    status.inlier_rmse = metrics.inlier_rmse;
+    status.metric_points = metrics.points;
+    status.ndt_iterations = diagnostics.iterations;
+    status.terrain_hint_used = terrain_hint_used;
+    status.registration_guess = tf2::eigenToTransform(
+      Eigen::Isometry3d(diagnostics.registration_guess.cast<double>())).transform;
+    status.raw_transform = tf2::eigenToTransform(
+      Eigen::Isometry3d(diagnostics.raw_transform.cast<double>())).transform;
     status.initial_guess = tf2::eigenToTransform(
       Eigen::Isometry3d(diagnostics.initial_guess.cast<double>())).transform;
     status.candidate_pose = tf2::eigenToTransform(
@@ -4073,6 +4268,7 @@ private:
 
     void Reset() {
         const bool have_seed = has_set_init_pose_;
+        has_terrain_hint_ = false;
         reset_tracking_state_locked(
           get_clock()->now(), have_seed, last_init_pos_, last_init_quat_);
         gl_once_gate_ = use_global_localization_init_;

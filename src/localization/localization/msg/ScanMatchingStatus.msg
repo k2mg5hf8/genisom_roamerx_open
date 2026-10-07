@@ -33,3 +33,19 @@ float32 total_callback_ms
 
 std_msgs/String[] prediction_labels
 geometry_msgs/Transform[] prediction_errors
+
+# Scan metrics from one nearest-neighbour pass over the NDT-aligned scan
+# (matching_error is the one named by fitness_metric; inlier_fraction uses
+# all points at inlier_distance).
+string fitness_metric
+float32 mean_sq_error
+float32 capped_sq_error
+float32 inlier_distance
+float32 inlier_rmse
+uint32 metric_points
+int32 ndt_iterations
+# NDT initial guess (planar guess plus terrain z/roll/pitch when
+# terrain_hint_used) and the unprojected 6-DoF NDT result.
+bool terrain_hint_used
+geometry_msgs/Transform registration_guess
+geometry_msgs/Transform raw_transform

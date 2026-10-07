@@ -328,12 +328,33 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   //   init_guess.block<3, 3>(0, 0) = Eigen::Quaternionf(fused_mean[3], fused_mean[4], fused_mean[5], fused_mean[6]).normalized().toRotationMatrix();
   // }
 
+  // NDT solves 6 DoF. With the planar guess its z, roll and pitch start from
+  // the reference (map start point) every scan; the terrain hint starts them
+  // where the previous accepted scans found them.
+  Eigen::Matrix4f registration_guess = init_guess;
+  if (hint_valid_ && std::isfinite(hint_z_) && std::isfinite(hint_roll_) &&
+      std::isfinite(hint_pitch_)) {
+    const float guess_yaw = std::atan2(init_guess(1, 0), init_guess(0, 0));
+    registration_guess.block<3, 3>(0, 0) = (
+      Eigen::AngleAxisf(guess_yaw, Eigen::Vector3f::UnitZ()) *
+      Eigen::AngleAxisf(hint_pitch_, Eigen::Vector3f::UnitY()) *
+      Eigen::AngleAxisf(hint_roll_, Eigen::Vector3f::UnitX())).toRotationMatrix();
+    registration_guess(2, 3) = hint_z_;
+  }
+  correction_diagnostics_.registration_guess = registration_guess;
+
   pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
   registration->setInputSource(cloud);
-  registration->align(*aligned, init_guess);
-  double ndt_score = registration->getFitnessScore();
+  registration->align(*aligned, registration_guess);
+  const ScanMetrics metrics =
+    compute_scan_metrics(*aligned, *registration, inlier_distance_);
+  correction_diagnostics_.metrics = metrics;
+  double ndt_score = !metrics.valid ? registration->getFitnessScore() :
+    (fitness_metric_ == FitnessMetric::kCappedSquared ? metrics.capped_sq : metrics.mean_sq);
 
   Eigen::Matrix4f trans = registration->getFinalTransformation();
+  correction_diagnostics_.raw_transform = trans;
+  correction_diagnostics_.has_raw_transform = trans.allFinite();
   if (!trans.allFinite()) {
     correction_diagnostics_.rejection_reason = "non_finite_transform";
     match_result_.is_converged_ = false;
@@ -389,10 +410,12 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   float yaw_jump = std::abs(std::atan2(correction(1, 0), correction(0, 0)));
   bool converged = registration->hasConverged();
   bool valid_score = std::isfinite(ndt_score) && ndt_score < max_fitness_score_;
+  const bool enough_inliers = min_inlier_fraction_ <= 0.0f ||
+    (metrics.valid && metrics.inlier_fraction >= min_inlier_fraction_);
 
   const bool finite_innovation =
     std::isfinite(xy_jump) && std::isfinite(yaw_jump);
-  if (!converged || !valid_score || !finite_innovation ||
+  if (!converged || !valid_score || !enough_inliers || !finite_innovation ||
       xy_jump > max_xy_jump_ || yaw_jump > max_yaw_jump_) {
     if (!converged) {
       correction_diagnostics_.rejection_reason = "not_converged";
@@ -400,6 +423,8 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
       correction_diagnostics_.rejection_reason = "non_finite_fitness";
     } else if (!valid_score) {
       correction_diagnostics_.rejection_reason = "fitness_gate";
+    } else if (!enough_inliers) {
+      correction_diagnostics_.rejection_reason = "inlier_fraction_gate";
     } else if (!finite_innovation) {
       correction_diagnostics_.rejection_reason = "non_finite_innovation";
     } else if (xy_jump > max_xy_jump_) {
@@ -408,8 +433,9 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
       correction_diagnostics_.rejection_reason = "yaw_jump_gate";
     }
     RCLCPP_WARN(rclcpp::get_logger("PoseEstimator"),
-      "Rejecting NDT correction: converged=%d score=%.4f/%.4f xy=%.3f/%.3f m yaw=%.2f/%.2f deg",
-      converged, ndt_score, max_fitness_score_, xy_jump, max_xy_jump_,
+      "Rejecting NDT correction: converged=%d score=%.4f/%.4f inliers=%.2f/%.2f xy=%.3f/%.3f m yaw=%.2f/%.2f deg",
+      converged, ndt_score, max_fitness_score_,
+      metrics.inlier_fraction, min_inlier_fraction_, xy_jump, max_xy_jump_,
       yaw_jump * 180.0f / static_cast<float>(M_PI),
       max_yaw_jump_ * 180.0f / static_cast<float>(M_PI));
     match_result_.is_converged_ = false;
@@ -522,6 +548,51 @@ pcl::PointCloud<PoseEstimator::PointT>::Ptr PoseEstimator::correct(
   correction_diagnostics_.rejection_reason.clear();
 
   return aligned;
+}
+
+PoseEstimator::ScanMetrics PoseEstimator::compute_scan_metrics(
+    const pcl::PointCloud<PointT>& aligned,
+    const pcl::Registration<PointT, PointT>& registration,
+    float inlier_distance) {
+  ScanMetrics metrics;
+  const auto tree = registration.getSearchMethodTarget();
+  if (aligned.empty() || !tree || !tree->getInputCloud() ||
+      tree->getInputCloud()->empty()) {
+    return metrics;
+  }
+  const double tau_sq = static_cast<double>(inlier_distance) * inlier_distance;
+  const int n = static_cast<int>(aligned.size());
+  double sum_sq = 0.0;
+  double sum_capped = 0.0;
+  double sum_inlier_sq = 0.0;
+  int found = 0;
+  int inliers = 0;
+  // Concurrent read-only kd-tree queries, as in pcl::NormalEstimationOMP.
+#pragma omp parallel for num_threads(4) schedule(static) \
+    reduction(+ : sum_sq, sum_capped, sum_inlier_sq, found, inliers)
+  for (int i = 0; i < n; ++i) {
+    std::vector<int> index(1);
+    std::vector<float> sq_dist(1);
+    if (tree->nearestKSearch(aligned.points[i], 1, index, sq_dist) <= 0) continue;
+    const double d2 = sq_dist[0];
+    ++found;
+    sum_sq += d2;
+    sum_capped += std::min(d2, tau_sq);
+    if (d2 <= tau_sq) {
+      ++inliers;
+      sum_inlier_sq += d2;
+    }
+  }
+  if (found == 0) return metrics;
+  metrics.valid = true;
+  metrics.points = static_cast<uint32_t>(found);
+  metrics.mean_sq = static_cast<float>(sum_sq / found);
+  metrics.capped_sq = static_cast<float>(sum_capped / found);
+  metrics.inlier_fraction = static_cast<float>(inliers) / static_cast<float>(found);
+  metrics.inlier_rmse = inliers > 0 ?
+    static_cast<float>(std::sqrt(sum_inlier_sq / inliers)) :
+    std::numeric_limits<float>::infinity();
+  return metrics;
 }
 
 /* getters */
