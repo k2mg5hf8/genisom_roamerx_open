@@ -356,6 +356,19 @@ public:
     // it the guess is the IMU-only UKF, which drifts within seconds while the
     // robot walks, so initialization could only succeed at a standstill.
     init_odom_anchor_enabled_ = declare_parameter<bool>("init_odom_anchor_enabled", false);
+    recovery_seed_from_odometry_ =
+      declare_parameter<bool>("recovery_seed_from_odometry", false);
+    // Odometry drift grows with the distance walked without an accepted scan
+    // (lidar gap, disk stall): the recovery agreement limits may grow with it,
+    // up to the caps. 0 keeps the fixed recovery_max_odom_* limits.
+    recovery_xy_error_per_meter_ = static_cast<float>(
+      declare_parameter<double>("recovery_xy_error_per_meter", 0.0));
+    recovery_yaw_error_per_meter_deg_ = static_cast<float>(
+      declare_parameter<double>("recovery_yaw_error_per_meter_deg", 0.0));
+    recovery_max_scaled_xy_error_ = static_cast<float>(
+      declare_parameter<double>("recovery_max_scaled_xy_error", 5.0));
+    recovery_max_scaled_yaw_error_deg_ = static_cast<float>(
+      declare_parameter<double>("recovery_max_scaled_yaw_error_deg", 60.0));
 
     static_imu_init_.SetParam(imu_init_time_, imu_init_queue_size_, imu_init_max_gyro_var_, imu_init_max_acce_var_);
     
@@ -627,6 +640,11 @@ private:
   bool recovery_search_enabled_ = false;
   double recovery_map_crop_radius_ = 0.0;
   bool init_odom_anchor_enabled_ = false;
+  bool recovery_seed_from_odometry_ = false;
+  float recovery_xy_error_per_meter_ = 0.0f;
+  float recovery_yaw_error_per_meter_deg_ = 0.0f;
+  float recovery_max_scaled_xy_error_ = 5.0f;
+  float recovery_max_scaled_yaw_error_deg_ = 60.0f;
   bool has_init_odom_anchor_ = false;
   Eigen::Matrix4f init_anchor_map_pose_{Eigen::Matrix4f::Identity()};
   Eigen::Matrix4f init_anchor_odom_pose_{Eigen::Matrix4f::Identity()};
@@ -2087,6 +2105,27 @@ private:
       gyro_rate <= stationary_gyro_rate_threshold_;
   }
 
+  // Moving recovery limits: fixed base plus growth with the odometry
+  // displacement since the last accepted scan.
+  void moving_recovery_limits(const rclcpp::Time& stamp, float& xy_limit,
+                              float& yaw_limit_deg) {
+    xy_limit = recovery_max_odom_xy_error_;
+    yaw_limit_deg = recovery_max_odom_yaw_error_deg_;
+    if ((recovery_xy_error_per_meter_ <= 0.0f &&
+         recovery_yaw_error_per_meter_deg_ <= 0.0f) || !has_reliable_odom_pose_) {
+      return;
+    }
+    Eigen::Matrix4f current_odom;
+    if (!lookup_odom_pose(stamp, current_odom)) return;
+    const float walked = (current_odom.block<2, 1>(0, 3) -
+                          last_reliable_odom_pose_.block<2, 1>(0, 3)).norm();
+    xy_limit = std::max(xy_limit, std::min(
+      recovery_max_scaled_xy_error_, xy_limit + recovery_xy_error_per_meter_ * walked));
+    yaw_limit_deg = std::max(yaw_limit_deg, std::min(
+      recovery_max_scaled_yaw_error_deg_,
+      yaw_limit_deg + recovery_yaw_error_per_meter_deg_ * walked));
+  }
+
   bool recovery_pose_agrees_with_prediction(const Eigen::Matrix4f& pose,
                                              const rclcpp::Time& stamp,
                                              float* max_xy = nullptr,
@@ -2097,10 +2136,11 @@ private:
     // odometry drift accumulated before the stop.
     const bool stationary = degraded_odom_stationary_episode_ &&
       robot_is_stationary_for_recovery(stamp);
-    const float xy_limit = stationary ? recovery_stationary_max_xy_error_ :
-                                        recovery_max_odom_xy_error_;
-    const float yaw_limit = stationary ? recovery_stationary_max_yaw_error_deg_ :
-                                         recovery_max_odom_yaw_error_deg_;
+    float moving_xy = recovery_max_odom_xy_error_;
+    float moving_yaw = recovery_max_odom_yaw_error_deg_;
+    moving_recovery_limits(stamp, moving_xy, moving_yaw);
+    const float xy_limit = stationary ? recovery_stationary_max_xy_error_ : moving_xy;
+    const float yaw_limit = stationary ? recovery_stationary_max_yaw_error_deg_ : moving_yaw;
     if (max_xy) *max_xy = xy_limit;
     if (max_yaw_deg) *max_yaw_deg = yaw_limit;
     // degraded_pose_ is intentionally frozen once its public fallback motion
@@ -2188,17 +2228,26 @@ private:
 
     const bool stationary = degraded_odom_stationary_episode_ &&
       robot_is_stationary_for_recovery(stamp);
+    float moving_xy = recovery_max_odom_xy_error_;
+    float moving_yaw = recovery_max_odom_yaw_error_deg_;
+    moving_recovery_limits(stamp, moving_xy, moving_yaw);
     recovery_verification_reference_max_xy_ = stationary ?
-      recovery_stationary_max_xy_error_ : recovery_max_odom_xy_error_;
+      recovery_stationary_max_xy_error_ : moving_xy;
     recovery_verification_reference_max_yaw_deg_ = stationary ?
-      recovery_stationary_max_yaw_error_deg_ : recovery_max_odom_yaw_error_deg_;
+      recovery_stationary_max_yaw_error_deg_ : moving_yaw;
 
     // Keep the public degraded pose unchanged while local NDT candidates are
     // checked without mutating either UKF. The anchor makes every candidate
     // offset relative to the same causal fused-odometry prediction.
     initialization_hold_pose_ = degraded_pose_;
     has_initialization_hold_pose_ = true;
-    recovery_verification_anchor_map_pose_ = degraded_pose_;
+    // degraded_pose_ freezes after degraded_max_translation; candidates are
+    // checked against the odometry-propagated pose, so anchor there.
+    Eigen::Matrix4f local_anchor = degraded_pose_;
+    if (recovery_seed_from_odometry_) {
+      deterministic_fused_initial_guess(stamp, local_anchor);
+    }
+    recovery_verification_anchor_map_pose_ = local_anchor;
     recovery_verification_anchor_odom_pose_ = current_odom_pose;
     has_recovery_verification_anchor_ = true;
     is_init_success_ = false;
@@ -2246,8 +2295,9 @@ private:
     last_recovery_search_time_ = get_clock()->now();
     auto cloud_copy = pcl::PointCloud<PointT>::Ptr(new pcl::PointCloud<PointT>(*cloud));
     auto map = global_map_points_ptr_;
-    const float max_xy = recovery_max_odom_xy_error_;
-    const float max_yaw = recovery_max_odom_yaw_error_deg_;
+    float max_xy = recovery_max_odom_xy_error_;
+    float max_yaw = recovery_max_odom_yaw_error_deg_;
+    moving_recovery_limits(source_stamp, max_xy, max_yaw);
     const float max_score = recovery_max_fitness_score_;
     const float planar_z = stationary_reference_z_;
     const float planar_roll = stationary_reference_roll_;
@@ -2260,6 +2310,7 @@ private:
     const PoseEstimator::FitnessMetric fitness_metric = fitness_metric_;
     const float inlier_distance = fitness_inlier_distance_;
     const float min_inlier_fraction = min_inlier_fraction_;
+    const bool seed_from_odometry = recovery_seed_from_odometry_;
     Eigen::Matrix4f source_odom_pose;
     if (!lookup_odom_pose(source_stamp, source_odom_pose)) {
       RCLCPP_WARN_THROTTLE(
@@ -2278,7 +2329,8 @@ private:
       [this, cloud_copy, map, expected_pose, max_xy, max_yaw, max_score,
        planar_z, planar_roll, planar_pitch, source_odom_pose, source_stamp_ns,
        recovery_episode_id, gnss_seed, terrain_hint, hint_z, hint_roll, hint_pitch,
-       crop_radius, fitness_metric, inlier_distance, min_inlier_fraction]() {
+       crop_radius, fitness_metric, inlier_distance, min_inlier_fraction,
+       seed_from_odometry]() {
         auto recovery_registration = create_registration(recovery_ndt_num_threads_);
         RecoveryResult unavailable;
         unavailable.episode_id = recovery_episode_id;
@@ -2355,7 +2407,9 @@ private:
                 result.best_observed_xy_error = xy_error;
                 result.best_observed_yaw_error_deg = yaw_error_deg;
               }
-              const bool transition_safe = from_gnss ||
+              // An odometry seed carries the drift being corrected: the line
+              // from it may legitimately cross hedges or walls.
+              const bool transition_safe = from_gnss || seed_from_odometry ||
                 transition_is_map_safe(seed_pose, pose);
               if (score > max_score || !enough_inliers ||
                   !poses_agree(pose, seed_pose, seed_max_xy, seed_max_yaw_deg) ||
@@ -2719,7 +2773,21 @@ private:
             "NDT correction rejected before UKF update by occupancy-map pose gate");
           return false;
         }
-        if (has_reliable_pose_ && !recovery_verification_from_gnss_ &&
+        // During recovery verification after a long gap the odometry path
+        // since the last reliable pose carries the drift being corrected and
+        // can cross walls; check the hop from the propagated recovery pose.
+        const bool check_recovery_hop =
+          recovery_seed_from_odometry_ && recovery_verification_active_ &&
+          has_deterministic_initial_guess;
+        if (check_recovery_hop &&
+            !transition_is_map_safe(deterministic_initial_guess, candidate_pose)) {
+          candidate_rejection_reason = "occupancy_transition_gate";
+          RCLCPP_WARN(get_logger(),
+            "NDT correction rejected before UKF update: recovery hop crosses occupied or unknown map space");
+          return false;
+        }
+        if (!check_recovery_hop &&
+            has_reliable_pose_ && !recovery_verification_from_gnss_ &&
             !odom_trajectory_is_map_safe(candidate_pose, scan_stamp_ns)) {
           candidate_rejection_reason = "occupancy_transition_gate";
           RCLCPP_WARN(get_logger(),
@@ -2981,8 +3049,16 @@ private:
             RCLCPP_ERROR(get_logger(),
               "Localization tracking lost; keeping DEGRADED pose continuity while autonomy is blocked");
           }
+          // The public degraded pose freezes after degraded_max_translation,
+          // but a found candidate is checked against the odometry-propagated
+          // pose (recovery_pose_agrees_with_prediction): while moving, a search
+          // around the frozen pose cannot pass. Seed it where it is checked.
+          Eigen::Matrix4f recovery_seed = degraded_pose_;
+          if (recovery_seed_from_odometry_) {
+            deterministic_fused_initial_guess(rclcpp::Time(stamp), recovery_seed);
+          }
           start_recovery_search(
-            raw_points_ptr_, degraded_pose_, rclcpp::Time(stamp));
+            raw_points_ptr_, recovery_seed, rclcpp::Time(stamp));
         } else {
           // No trusted map pose exists yet. This is still initialization, not
           // a tracking loss, and recovery must not be seeded from identity.
