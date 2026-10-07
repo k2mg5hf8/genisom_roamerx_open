@@ -15,17 +15,69 @@ localization:
     # Front Airy (rslidar_head) -> base_link from /ota/calibration_results.yaml
     # (imu_front_to_base with lidar_front_to_imu_front = identity): the Airy
     # axis looks forward, x of the cloud points down.
-    init_T: [0.0, 0.0, 1.0, 0.36615,
-             0.0, 1.0, 0.0, 0.0,
-            -1.0, 0.0, 0.0, 0.0,
-             0.0, 0.0, 0.0, 1.0]
+    # The Airy is pitched ~2.1 deg beyond the nominal 90 (calibrated 2026-10-05,
+    # same rotation as rslidar_head in security_robot zsm1_sensors.launch.py;
+    # nominal: [0 0 1; 0 1 0; -1 0 0]). With the terrain hint below the body
+    # pitch is learned, so nominal and calibrated replay alike; calibrated keeps
+    # localization consistent with the sensor TF the costmaps use.
+    init_T: [-0.03667, -0.00109, 0.99933, 0.36615,
+              0.00316,  0.99999, 0.0012,  0.0,
+             -0.99932,  0.0032, -0.03666, 0.0,
+              0.0, 0.0, 0.0, 1.0]
     # Start from the configured/operator pose. Global localization runs a
     # synchronous whole-map ICP on every map load (seconds of blocking and a
     # 23 m wrong seed on ZSL-1 on 2026-09-29); /initialpose re-seeds instead.
     use_global_localization_init: false
-    # Dense map target: with the dual-LiDAR cloud every scan was accepted in
-    # the 2026-09-30 stationary A/B on ISR_vicon_20260908.
-    globalmap_voxel_size: 0.10
+
+    # Outdoor campus maps. Replay A/B 2026-10-08 (security_robot tools/replay,
+    # session zsm1_map-skol-02-autonomy_20261006_052136 on skol-entrance 1.1):
+    # vendor settings 48% scans accepted, status 3 43%, lost for 405 s after a
+    # wrong minimum; with the settings below 99.8% / 99.2%, longest non-3 4.1 s
+    # (the start), standstill jitter p50 6.5 -> 4.5 cm, NDT iterations 14 -> 4.
+    # Map PCDs are 0.3 m; a denser PCD would make NDT 5-20x slower (0.10 gave
+    # 1.4 Hz on 2026-10-06). Indoor maps (ISR_vicon) ran 0.10 / ndt_resolution
+    # 0.5 and need those values back.
+    globalmap_voxel_size: 0.30
+    # 0.5 m cells on a 0.3 m map: 17% of cells have the 6 points NDT needs;
+    # 1.0 m: 70% (fewer iterations, less jitter).
+    ndt_resolution: 1.0
+    # Initialization (operator pose, seeded start, re-anchor, map load) follows
+    # the fused odometry from the seed, so it also succeeds while walking.
+    init_odom_anchor_enabled: true
+    # NDT starts from the z/roll/pitch of the previous scans instead of the
+    # start point's (the courtyard is up to +0.9 m): iterations p50 14 -> 4.
+    ndt_terrain_guess_enabled: true
+    # Background recovery search after a loss, seeded and checked where the
+    # odometry puts the robot (not at the frozen degraded pose), with limits
+    # that grow with the distance walked without an accepted scan (lidar gap,
+    # disk stall), on a map crop around the seed. Sequence spreads above the
+    # NDT jitter (+-13 cm at a standstill on the 0.3 m map).
+    recovery_search_enabled: true
+    recovery_map_crop_radius: 40.0
+    recovery_seed_from_odometry: true
+    recovery_xy_error_per_meter: 0.15
+    recovery_yaw_error_per_meter_deg: 1.5
+    recovery_max_scaled_xy_error: 4.0
+    recovery_max_scaled_yaw_error_deg: 45.0
+    recovery_verification_max_xy_spread: 0.25
+    recovery_verification_max_yaw_spread_deg: 5.0
+    reanchor_tolerant_sequence: true
+    reanchor_max_xy_spread: 0.25
+    # Fitness capped at fitness_inlier_distance^2 per point: people, cars,
+    # vegetation and returns beyond the map edge no longer inflate it. Its
+    # range is [0, 0.25], so the thresholds are lower than for mean_sq; delete
+    # this block to return to mean_sq. /status carries both values.
+    fitness_metric: capped_sq
+    fitness_inlier_distance: 0.5
+    init_match_score_threshold: 0.08
+    tracking_max_fitness_score: 0.12
+    # Recovery stricter than tracking: a wrong minimum near a drifted seed
+    # scored 0.06-0.07 in replay, the true pose ~0.03. A failed recovery waits
+    # for the operator; a wrong one drives on a wrong pose.
+    recovery_max_fitness_score: 0.05
+    recovery_verification_max_fitness_score: 0.05
+    tracking_severe_fitness_score: 0.18
+    tracking_severe_min_inlier_fraction: 0.3
 
 pointcloud_self_filter:
   ros__parameters:
