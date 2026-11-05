@@ -243,7 +243,7 @@ controller_server:
       vx_std: 0.2
       vy_std: 0.0
       wz_std: 0.4
-      vx_max: 1.0 #1.5 #0.5
+      vx_max: 0.8 # ZSL-1 autonomy speed limit (2026-11-05); was 1.0 #1.5 #0.5
       vx_min: -0.35 #-1.5 #-0.35
       vy_max: 0.1 #0.5
       wz_max: 0.5 #1.2
