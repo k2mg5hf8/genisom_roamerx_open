@@ -15,15 +15,16 @@ localization:
     # Front Airy (rslidar_head) -> base_link from /ota/calibration_results.yaml
     # (imu_front_to_base with lidar_front_to_imu_front = identity): the Airy
     # axis looks forward, x of the cloud points down.
-    # The Airy is pitched ~2.1 deg beyond the nominal 90 (calibrated 2026-10-05,
-    # same rotation as rslidar_head in security_robot zsm1_sensors.launch.py;
-    # nominal: [0 0 1; 0 1 0; -1 0 0]). With the terrain hint below the body
-    # pitch is learned, so nominal and calibrated replay alike; calibrated keeps
-    # localization consistent with the sensor TF the costmaps use.
-    init_T: [-0.03667, -0.00109, 0.99933, 0.36615,
-              0.00316,  0.99999, 0.0012,  0.0,
-             -0.99932,  0.0032, -0.03666, 0.0,
-              0.0, 0.0, 0.0, 1.0]
+    # Rotation = rslidar_head in security_robot zsm1_sensors.launch.py (keep the
+    # two equal; nominal: [0 0 1; 0 1 0; -1 0 0]). Front unit installed 2026-11-09,
+    # calibrated 2026-11-11 against the central IMU: pitched ~0.65 deg beyond the
+    # nominal 90 (old unit, 2026-10-05: ~2.1 deg, init_T rows -0.03667 -0.00109
+    # 0.99933 / 0.00316 0.99999 0.0012 / -0.99932 0.0032 -0.03666). On trial: a
+    # replay favoured it, a live comparison with 2026-11-10 decides.
+    init_T: [-0.01137, -0.00117, 0.99993, 0.36615,
+             -0.00696, 0.99998, 0.00109, 0.00000,
+             -0.99991, -0.00695, -0.01137, 0.00000,
+             0.00000, 0.00000, 0.00000, 1.00000]
     # Start from the configured/operator pose. Global localization runs a
     # synchronous whole-map ICP on every map load (seconds of blocking and a
     # 23 m wrong seed on ZSL-1 on 2026-09-29); /initialpose re-seeds instead.
