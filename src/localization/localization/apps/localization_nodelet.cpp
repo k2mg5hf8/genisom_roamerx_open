@@ -1706,8 +1706,16 @@ private:
     float sampled_vy = 0.0f;
     const bool motor_twist_fresh = motor_twist_at_locked(
       stamp_ns, sampled_vx, sampled_vy);
-    const float vx = motor_twist_fresh ? std::clamp(sampled_vx, -1.5f, 1.5f) : 0.0f;
-    const float vy = motor_twist_fresh ? std::clamp(sampled_vy, -0.5f, 0.5f) : 0.0f;
+    // vx/vy are in the fused (world-like) axes, not the body: a per-axis cap
+    // (formerly |vy| <= 0.5) cut the prediction whenever the robot drove along
+    // the fused y axis faster than 0.5 m/s. Cap the speed magnitude instead.
+    float vx = motor_twist_fresh ? sampled_vx : 0.0f;
+    float vy = motor_twist_fresh ? sampled_vy : 0.0f;
+    const float planar_speed = std::hypot(vx, vy);
+    if (planar_speed > 1.5f) {
+      vx *= 1.5f / planar_speed;
+      vy *= 1.5f / planar_speed;
+    }
     if (!std::isfinite(imu_yaw_rate)) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,
