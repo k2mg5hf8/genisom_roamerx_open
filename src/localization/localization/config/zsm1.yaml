@@ -79,6 +79,14 @@ localization:
     recovery_verification_max_fitness_score: 0.05
     tracking_severe_fitness_score: 0.18
     tracking_severe_min_inlier_fraction: 0.3
+    # Deskew the 0.1 s scan with the fused odometry. The dual-Airy merger
+    # stamps the cloud with the first point and gives each point its offset in
+    # seconds in field `t` (config.yaml's `timestamp` in ns is the Livox field).
+    # Full medical-center replay 2026-11-12: error p50/p95/max 7.0/17.6/27.1 ->
+    # 6.0/15.7/25.8 cm, yaw p95 1.14 -> 0.84 deg, +11 ms per scan (laptop).
+    deskew_enabled: true
+    deskew_timestamp_field: "t"
+    deskew_timestamp_scale_sec: 1.0
 
 pointcloud_self_filter:
   ros__parameters:
