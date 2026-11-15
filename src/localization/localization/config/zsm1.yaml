@@ -100,4 +100,13 @@ pointcloud_self_filter:
     # clouds with returns inside the footprint 50-53 % -> 0.9-2.8 % (the rest is
     # a person at the standing robot), nothing removed beyond 0.09 m of the
     # footprint, localization unchanged (error p95 2.4-2.8 cm, no status loss).
-    exclusion_boxes: [-0.20, 0.56, -0.30, 0.30, -0.99, 0.26]
+    # Second box: the front legs at speed and on rough ground (2026-11-15, ~1.2 m/s)
+    # swing out to |y| 0.41 and up to +0.34 over base_link at x 0.42-0.47, beyond the
+    # body box; points there were the "obstacle" next to the footprint before the
+    # remaining MPPI fails (a strip along the side as the robot drives on). Box =
+    # base_link x 0.37..0.54, y -0.42..0.42, z -0.31..0.38 (<= 0.18 m beside the
+    # footprint, nothing ahead of it). Replays of main-apteka-03 / lab-apteka-03:
+    # clouds with returns within 0.2 m of the footprint 1 s before a fail
+    # 9-56 % -> 0-1.9 %, nothing removed beyond 0.2 m, localization unchanged.
+    exclusion_boxes: [-0.20, 0.56, -0.30, 0.30, -0.99, 0.26,
+                      -0.38, 0.30, -0.42, 0.42, 0.01, 0.17]
