@@ -108,6 +108,13 @@ public:
    * @return Time before collision in seconds
    */
   double getTimeBeforeCollision() const;
+  /**
+   * @brief Whether a STOP polygon cuts only forward motion (stop_forward_only).
+   * For a zone ahead of the robot: an obstacle in it blocks driving on, while
+   * turning and reversing stay possible (checked by the later polygons).
+   * @return True if only the forward velocity is stopped
+   */
+  bool getStopForwardOnly() const;
 
   /**
    * @brief Gets polygon points
@@ -196,6 +203,8 @@ protected:
   double slowdown_ratio_;
   /// @brief Time before collision in seconds
   double time_before_collision_;
+  /// @brief STOP polygon cuts only forward motion
+  bool stop_forward_only_{false};
   /// @brief Time step for robot movement simulation
   double simulation_time_step_;
   /// @brief Footprint subscriber

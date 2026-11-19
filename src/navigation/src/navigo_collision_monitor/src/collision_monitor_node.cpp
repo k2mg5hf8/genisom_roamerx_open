@@ -364,6 +364,10 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
   Action robot_action{DO_NOTHING, cmd_vel_in};
   // Polygon causing robot action (if any)
   std::shared_ptr<Polygon> action_polygon;
+  // Command the later polygons check: the input, or what is left of it after a
+  // stop_forward_only polygon cut the forward motion (turning/reversing).
+  Velocity cmd_vel_checked = cmd_vel_in;
+  bool forward_stopped = false;
 
   for (std::shared_ptr<Polygon> polygon : polygons_) {
     if (!polygon->getEnabled()) {
@@ -377,15 +381,22 @@ void CollisionMonitor::process(const Velocity & cmd_vel_in)
     const ActionType at = polygon->getActionType();
     if (at == STOP || at == SLOWDOWN) {
       // Process STOP/SLOWDOWN for the selected polygon
-      if (processStopSlowdown(polygon, collision_points, cmd_vel_in, robot_action)) {
+      if (processStopSlowdown(polygon, collision_points, cmd_vel_checked, robot_action)) {
         action_polygon = polygon;
+        if (robot_action.action_type == STOP_FORWARD) {
+          forward_stopped = true;
+          cmd_vel_checked = robot_action.req_vel;
+        }
       }
     } else if (at == APPROACH) {
       // Process APPROACH for the selected polygon
-      if (processApproach(polygon, collision_points, cmd_vel_in, robot_action)) {
+      if (processApproach(polygon, collision_points, cmd_vel_checked, robot_action)) {
         action_polygon = polygon;
       }
     }
+  }
+  if (forward_stopped && robot_action.req_vel.x > 0.0) {
+    robot_action.req_vel.x = 0.0;  // no later polygon may bring forward motion back
   }
 
   if (robot_action.action_type != robot_action_prev_.action_type) {
@@ -409,7 +420,15 @@ bool CollisionMonitor::processStopSlowdown(
   Action & robot_action) const
 {
   if (polygon->getPointsInside(collision_points) > polygon->getMaxPoints()) {
-    if (polygon->getActionType() == STOP) {
+    if (polygon->getActionType() == STOP && polygon->getStopForwardOnly()) {
+      // Forward motion only; nothing to do for a turning/reversing command
+      if (robot_action.req_vel.x <= 0.0) {
+        return false;
+      }
+      robot_action.action_type = STOP_FORWARD;
+      robot_action.req_vel.x = 0.0;
+      return true;
+    } else if (polygon->getActionType() == STOP) {
       // Setting up zero velocity for STOP model
       robot_action.action_type = STOP;
       robot_action.req_vel.x = 0.0;
@@ -470,6 +489,11 @@ void CollisionMonitor::printAction(
       get_logger(),
       "Robot to slowdown for %f percents due to %s polygon",
       action_polygon->getSlowdownRatio() * 100,
+      action_polygon->getName().c_str());
+  } else if (robot_action.action_type == STOP_FORWARD) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Robot to stop moving forward due to %s polygon (turning and reversing allowed)",
       action_polygon->getName().c_str());
   } else if (robot_action.action_type == APPROACH) {
     RCLCPP_INFO(

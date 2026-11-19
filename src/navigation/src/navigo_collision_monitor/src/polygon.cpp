@@ -134,6 +134,11 @@ double Polygon::getTimeBeforeCollision() const
   return time_before_collision_;
 }
 
+bool Polygon::getStopForwardOnly() const
+{
+  return stop_forward_only_;
+}
+
 void Polygon::getPolygon(std::vector<Point> & poly) const
 {
   poly = poly_;
@@ -261,6 +266,17 @@ bool Polygon::getCommonParameters(std::string & polygon_pub_topic)
     navigo_util::declare_parameter_if_not_declared(
       node, polygon_name_ + ".max_points", rclcpp::ParameterValue(3));
     max_points_ = node->get_parameter(polygon_name_ + ".max_points").as_int();
+
+    if (action_type_ == STOP) {
+      // ZSM-1 (2026-11-19): a full stop also zeroes turning and reversing and holds
+      // while the points stay inside, so a static object in a zone ahead (a door
+      // post) held the robot for good. With stop_forward_only the zone stops only
+      // forward motion; list it before the approach polygons, which then check the
+      // remaining turning/reversing command.
+      navigo_util::declare_parameter_if_not_declared(
+        node, polygon_name_ + ".stop_forward_only", rclcpp::ParameterValue(false));
+      stop_forward_only_ = node->get_parameter(polygon_name_ + ".stop_forward_only").as_bool();
+    }
 
     if (action_type_ == SLOWDOWN) {
       navigo_util::declare_parameter_if_not_declared(
